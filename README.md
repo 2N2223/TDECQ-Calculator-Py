@@ -68,13 +68,13 @@ V1.3.0/
 # 环境：Python 3.10+，numpy / scipy / matplotlib
 pip install numpy scipy matplotlib
 
-# 单用例（128G PRBS13 电域，自动 seed/偏移/窗长；含绘图）
-python run_tdecq.py --input data/virtuoso_export/PRBS13_128G_PAM4_32GLP.csv \
+# 单用例
+python run_tdecq.py --input w.csv \
     --rate-gbps 128 --pattern auto --domain electrical \
     --out results/prbs13_128g_32glp.json -p plots/prbs13_128g_32glp.png
 
-# 112G PRBS31 长记录（任意 seed 自动恢复）
-python run_tdecq.py --input data/psf2csv/PRBS31_112G_LC_RC50.csv \
+# 任意 seed 自动恢复
+python run_tdecq.py --input w.csv \
     --rate-gbps 112 --pattern prbs --prbs-order 31 --domain electrical \
     --out out.json
 
@@ -85,14 +85,5 @@ python run_tdecq.py --input w.csv --rate-gbps 128 --pattern prbs13 \
 # 启用 IEEE 802.3dj 抽头边界约束 + 多 tap 候选（默认关闭；默认路径逐位一致）
 python run_tdecq.py --input w.csv --rate-gbps 128 --pattern prbs13 \
     --ffe-bounds --out out.json -p eye.png
-
-# 批量 + 验收
-python run_all.py --results results
-python tests/validate_metrics.py --results results      # -> 33/33 PASS
-
-# 单元测试
-python -m unittest discover -s tests -q                 # 131 tests OK
-# （真实 spectre 数据回归在 _real_data/ 缺失时按设计干净跳过）
-```
 
 详细使用见 `docs/USAGE.md`；输出 JSON 字段见 `SPEC.md` 
