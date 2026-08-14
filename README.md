@@ -1,10 +1,5 @@
 # TDECQ / TECQ 测量工具 — V1.3.1
 
-> V1.3.1 基于 V1.3.0 发布版，修复多 FFE Tap（15 taps = 3 pre + 11 post）验证发现的
-> 3 个缺陷（P1 对齐幻影 / P1b 指标 NaN / P2 弱盆 σ 退化），并新增对应回归测试
-> （136 个单元测试）。默认 5-tap 路径与 V1.3.0 基线**逐位一致**（33 例 JSON 除
-> `elapsed_sec` 外 diff=0），33/33 验收不变。修复机制详见 `DEVELOPMENT_NOTES.md`。
-
 对 PAM4 接收波形计算 IEEE 802.3-2022 风格 **TDECQ（光域）/ TECQ（电域）** 指标。
 全部参数（CSV 解析、码型识别、CDR 相位、符号偏移、测试窗长度、PRBS seed、FFE
 tap 几何）均由波形自动估计，**无逐用例标定、无 case_id 参与算法**；`--case` 仅作
@@ -100,5 +95,4 @@ python -m unittest discover -s tests -q                 # 131 tests OK
 # （真实 spectre 数据回归在 _real_data/ 缺失时按设计干净跳过）
 ```
 
-详细使用见 `docs/USAGE.md`；输出 JSON 字段见 `SPEC.md` §5；算法见
-`IMPLEMENTATION.md`。
+详细使用见 `docs/USAGE.md`；输出 JSON 字段见 `SPEC.md` 
