@@ -87,6 +87,40 @@ def _eye_phase(M, cdr, spu):
     return np.concatenate([M[:, cdr:], M[:, :cdr]], axis=1)
 
 
+def _phase_density(eye, n_y_bins=200):
+    """Build an eye density grid without floating-point x-bin collisions.
+
+    ``eye`` columns are discrete sample phases, so their horizontal bins are
+    assigned with integer indices.  Constructing floating-point phase values
+    and feeding them back to ``histogram2d`` is unsafe at e.g. 100 samples/UI:
+    round-off puts two boundary-valued phases in one bin and leaves the next
+    bin empty, which renders false vertical breaks in an otherwise continuous
+    eye.  The returned horizontal edges are normalised UI coordinates.
+    """
+    eye = np.asarray(eye, dtype=float)
+    if eye.ndim != 2 or eye.shape[1] < 1:
+        raise ValueError("eye must have shape (n_symbols, samples_per_ui)")
+    n_sym, spu = eye.shape
+    p_lo = float(np.min(eye))
+    p_hi = float(np.max(eye))
+    if not np.isfinite(p_lo) or not np.isfinite(p_hi):
+        raise ValueError("eye contains non-finite samples")
+    if p_hi <= p_lo:
+        p_lo -= 0.5
+        p_hi += 0.5
+    p_edges = np.linspace(p_lo, p_hi, int(n_y_bins) + 1)
+    counts = np.zeros((spu, int(n_y_bins)), dtype=float)
+    # Column zero is the CDR sampling phase and is displayed at the centre.
+    # Integer permutation guarantees exactly one source phase per x bin.
+    phase_bins = (np.arange(spu, dtype=int) + spu // 2) % spu
+    for source_col, display_bin in enumerate(phase_bins):
+        counts[display_bin], _ = np.histogram(
+            eye[:, source_col], bins=p_edges)
+    t_edges_ui = np.linspace(0.0, 1.0, spu + 1)
+    assert np.all(counts.sum(axis=1) == n_sym)
+    return t_edges_ui, p_edges, counts
+
+
 def _density_eye(M, tru, cdr, spu, bins=(220, 220), xmax=1.0):
     """2-D histogram of the equalised signal over one UI.
 
@@ -94,15 +128,10 @@ def _density_eye(M, tru, cdr, spu, bins=(220, 220), xmax=1.0):
     using the sampling phase ``cdr`` as the origin.  Returns (x, y, H) with
     x in UI (0..xmax) and y in the signal units.
     """
-    n_sym = M.shape[0]
     eye = _eye_phase(M, cdr, spu)
-    # Sampling phase is the centre of the displayed eye: column j of ``eye``
-    # is phase (cdr+j)%spu, so its UI position is (0.5 + j/spu) modulo 1 UI.
-    phase_frac = xmax * ((0.5 + np.arange(spu) / float(spu)) % 1.0)
-    H, xe, ye = np.histogram2d(
-        np.tile(phase_frac[None, :], (n_sym, 1)).ravel(),
-        eye.ravel(), bins=bins,
-        range=[[0.0, xmax], [float(eye.min()), float(eye.max())]])
+    n_y = int(bins[1] if hasattr(bins, "__len__") else bins)
+    xe_ui, ye, H = _phase_density(eye, n_y_bins=n_y)
+    xe = xe_ui * float(xmax)
     x = 0.5 * (xe[:-1] + xe[1:])
     y = 0.5 * (ye[:-1] + ye[1:])
     return x, y, H
@@ -157,13 +186,77 @@ def _collect_center_histograms(M, cdr, spu, p_ave, oma_outer, n_bins=512):
     return y_bins, hist_for(sL_all), hist_for(sR_all)
 
 
-def _format_tap_label(value, is_main=False, at_bound=None):
-    """Format one FFE tap value for the suptitle with emphasis markers.
+def eye_ylim(values, below=0.06, above=0.14):
+    """Eye-diagram y-range relative to the signal span (any unit/scale).
 
-    The main tap is set in bold (``\\mathbf``); a tap touching a lower
-    bound is underlined and one touching an upper bound overlined
-    (``\\underline`` / ``\\overline``), so IEEE-802.3dj bounded runs show
-    which cursors sit on a constraint.
+    The margins are fractions of the peak-to-peak span (the top margin
+    leaves room for the window labels), so W, mW, V and mV records all fill
+    the panel; the previous fixed 0.1-unit margin squashed records whose
+    span is far below one unit.
+    """
+    v = np.asarray(values, dtype=float)
+    v = v[np.isfinite(v)]
+    if v.size == 0:
+        return 0.0, 1.0
+    lo, hi = float(v.min()), float(v.max())
+    span = hi - lo
+    if span <= 0:
+        span = abs(hi) if hi != 0 else 1.0
+    return lo - below * span, hi + above * span
+
+
+THRESHOLD_LABELS = (r'$P_{th1} = P_{ave} - \mathrm{OMA}/3$',
+                    r'$P_{th2} = P_{ave}$',
+                    r'$P_{th3} = P_{ave} + \mathrm{OMA}/3$')
+
+
+def eye_overlay(M, tru, cdr, spu, out=None):
+    """Decision thresholds and histogram windows to draw on an eye.
+
+    A standard-mode result (``out['standard_measurement']``) carries the
+    measured OMA_outer, Pave, thresholds and the exact window phases, so the
+    overlay shows what the metric used.  Otherwise the thresholds come from
+    the class means (with a monotonic fallback span on degenerate eyes) and
+    the windows sit at the nominal 0.45/0.55 UI.
+
+    Returns dict(p_ave, oma, pth, windows); ``windows`` holds
+    ``(x0_ui, x1_ui, label)`` in the display coordinates of
+    :func:`_phase_density` (sampling phase ``cdr`` at 0.5 UI).
+    """
+    sm = (out or {}).get("standard_measurement")
+    if sm and sm.get("pave") is not None and sm.get("pth"):
+        p_ave = float(sm["pave"])
+        oma = float(sm["oma"])
+        pth = [float(x) for x in sm["pth"]]
+        windows = []
+        for key, name in (("window_left", "left"), ("window_right", "right")):
+            ph = np.asarray(sm.get(key) or [], dtype=int)
+            if ph.size == 0:
+                continue
+            d = ((ph - int(cdr)) % spu + spu // 2) % spu
+            x0, x1 = d.min() / spu, (d.max() + 1) / spu
+            windows.append((x0, x1, "%.2f UI" % (0.5 * (x0 + x1))))
+        return dict(p_ave=p_ave, oma=oma, pth=pth, windows=windows)
+    lv = eq.levels_at(M, tru, cdr)
+    p_ave = float(lv.mean())
+    oma = float(lv[3] - lv[0])
+    if not (np.isfinite(oma) and oma > 0):
+        level_span = (float(np.max(np.abs(lv)))
+                      if np.all(np.isfinite(lv)) else 0.0)
+        oma = 2.0 * max(level_span, 1e-9)
+    pth = [p_ave - oma / 3.0, p_ave, p_ave + oma / 3.0]
+    windows = [(f - _HIST_HALF_UI, f + _HIST_HALF_UI, label)
+               for f, label in _HIST_WINDOWS]
+    return dict(p_ave=p_ave, oma=oma, pth=pth, windows=windows)
+
+
+def _format_tap_label(value, is_main=False, at_bound=None):
+    """Format one FFE tap value with portable ASCII-only markers.
+
+    ``M`` marks the declared main tap and ``LB``/``UB`` mark lower/upper
+    bound contact.  Mathtext commands such as ``\\mathbf`` are deliberately
+    avoided: some remote Matplotlib builds reject them during ``savefig``,
+    and nesting bold with bound under/overlines is not parser-portable.
 
     Parameters
     ----------
@@ -177,16 +270,17 @@ def _format_tap_label(value, is_main=False, at_bound=None):
 
     Returns
     -------
-    str a matplotlib-mathtext label.
+    str such as ``"0.125"``, ``"M:0.900"`` or ``"M/LB:0.800"``.
     """
-    s = "%.3f" % float(value)
-    if at_bound == "lb":
-        s = r"$\underline{%s}$" % s
-    elif at_bound == "ub":
-        s = r"$\overline{%s}$" % s
+    marks = []
     if is_main:
-        s = r"$\mathbf{%s}$" % s
-    return s
+        marks.append("M")
+    if at_bound == "lb":
+        marks.append("LB")
+    elif at_bound == "ub":
+        marks.append("UB")
+    prefix = ("/".join(marks) + ":") if marks else ""
+    return "%s%.3f" % (prefix, float(value))
 
 
 def make_diagnostic_plot(input_csv, out, png_path, rate_gbps=112,
@@ -240,7 +334,10 @@ def make_diagnostic_plot(input_csv, out, png_path, rate_gbps=112,
                              case_id=case_id,
                              ffe_pre_cursor=ffe_pre_cursor,
                              ffe_post_cursor=ffe_post_cursor,
-                             tap_weights=out.get("tap_weights"))
+                             tap_weights=out.get("tap_weights"),
+                             dfe_b1=out.get("dfe_b1", 0.0),
+                             standard_measurement=out.get(
+                                 "standard_measurement"))
     M = data["M"]
     tru = data["tru"]
     cdr = data["cdr"]
@@ -249,11 +346,10 @@ def make_diagnostic_plot(input_csv, out, png_path, rate_gbps=112,
     unit = "mV" if domain == "electrical" else "mW"
     unit_label = "Voltage (mV)" if domain == "electrical" else "Power (mW)"
 
-    # bjarkeaf/pam4-link-sim visual constants: one UI in ps.
-    # rate_gbps is in Gbps, so one UI is 1/(rate_gbps*1e9) seconds.
-    # Convert to ps explicitly; the previous expression omitted 1e9 and
-    # stretched the eye x-axis by 1e9 (matplotlib then displayed a 1e9 offset).
-    ui_ps = 1.0e3 / float(rate_gbps)
+    # One UI in ps.  rate_gbps is the aggregate PAM4 data rate (2 bits per
+    # symbol), so one UI is 2/(rate_gbps*1e9) s = 2e3/rate_gbps ps (the same
+    # UI = 2/rate convention as the measurement front end).
+    ui_ps = 2.0e3 / float(rate_gbps)
 
     fig = plt.figure(figsize=(12, 10))
     gs = fig.add_gridspec(3, 2, height_ratios=[3, 1, 0.85],
@@ -267,16 +363,9 @@ def make_diagnostic_plot(input_csv, out, png_path, rate_gbps=112,
     # ---- equalised density eye (bjarkeaf/pam4-link-sim style) ----
     eye = _eye_phase(M, cdr, spu)
     n_sym = eye.shape[0]
-    # cdr-first folded columns: column j is phase (cdr+j)%spu, mapped to
-    # 0.5 UI + j/spu (wrapped into [0, 1) UI).  This places the sampling
-    # instant at the centre of the eye and keeps the 0.45/0.55 UI windows
-    # correctly positioned around it.
-    t_col = ui_ps * ((0.5 + np.arange(spu) / float(spu)) % 1.0)
-    t_eye = np.tile(t_col, n_sym)
     p_eye = eye.flatten()
-    counts, t_edges, p_edges = np.histogram2d(
-        t_eye, p_eye, bins=[spu, 200],
-        range=[[0.0, ui_ps], [float(p_eye.min()), float(p_eye.max())]])
+    t_edges_ui, p_edges, counts = _phase_density(eye, n_y_bins=200)
+    t_edges = t_edges_ui * ui_ps
     cmap = _cmap_for(eye_color)
     ax1.set_facecolor("#05050f")
     ax1.pcolormesh(t_edges, p_edges, counts.T, cmap=cmap,
@@ -284,37 +373,21 @@ def make_diagnostic_plot(input_csv, out, png_path, rate_gbps=112,
                                   vmax=max(float(counts.max()), 1e-12)),
                    shading="auto")
 
-    # PAM4 thresholds from class-mean Pave/OMA.  On degenerate closed-eye
-    # fallback records the class means may come out inverted (lv[3]-lv[0]<=0);
-    # keep the displayed thresholds monotonic by using a symmetric span around
-    # Pave derived from the observed level magnitude.
-    lv = eq.levels_at(M, tru, cdr)
-    p_ave = float(lv.mean())
-    oma_outer = float(lv[3] - lv[0])
-    if np.isfinite(oma_outer) and oma_outer > 0:
-        oma_plot = oma_outer
-    else:
-        level_span = float(np.max(np.abs(lv))) if np.all(np.isfinite(lv)) else 0.0
-        oma_plot = 2.0 * max(level_span, 1e-9)
-    p_th1 = p_ave - oma_plot / 3.0
-    p_th2 = p_ave
-    p_th3 = p_ave + oma_plot / 3.0
-    for p, label in [(p_th1, r'$P_{th1} = P_{ave} - \mathrm{OMA}/3$'),
-                     (p_th2, r'$P_{th2} = P_{ave}$'),
-                     (p_th3, r'$P_{th3} = P_{ave} + \mathrm{OMA}/3$')]:
+    # PAM4 thresholds and histogram windows: the measured values of a
+    # standard-mode result, else class means and the nominal 0.45/0.55 UI.
+    ov = eye_overlay(M, tru, cdr, spu, out)
+    p_ave, oma_outer = ov["p_ave"], ov["oma"]
+    for p, label in zip(ov["pth"], THRESHOLD_LABELS):
         ax1.axhline(p, color="white", lw=0.8, ls="--", alpha=0.7)
         ax1.text(0.01, p, label, transform=ax1.get_yaxis_transform(),
                  va="bottom", ha="left", fontsize=9, color="white")
     # Histogram windows (0.04 UI wide per IEEE 802.3 Clause 121.8.5.3).
-    half_win = _HIST_HALF_UI * ui_ps
-    for phase_frac, label in _HIST_WINDOWS:
-        cx = phase_frac * ui_ps
-        ax1.axvspan(cx - half_win, cx + half_win, color="white", alpha=0.15)
-        ax1.text(cx, 0.97, label, transform=ax1.get_xaxis_transform(),
+    for x0, x1, label in ov["windows"]:
+        ax1.axvspan(x0 * ui_ps, x1 * ui_ps, color="white", alpha=0.15)
+        ax1.text(0.5 * (x0 + x1) * ui_ps, 0.97, label,
+                 transform=ax1.get_xaxis_transform(),
                  va="top", ha="center", fontsize=9, color="white", rotation=90)
-    y_lo = min(0.0, float(p_eye.min()))
-    y_hi = float(p_eye.max()) + 0.1 * max(1.0, float(np.ptp(p_eye)))
-    ax1.set_ylim(y_lo, y_hi)
+    ax1.set_ylim(*eye_ylim(p_eye))
     ax1.set_xlabel("Time (ps)")
     ax1.set_ylabel(unit_label)
     ax1.set_title("Equalized eye diagram")
@@ -327,16 +400,17 @@ def make_diagnostic_plot(input_csv, out, png_path, rate_gbps=112,
                  color="tab:blue", label="0.45 UI")
     ax_hist.barh(y_bins, F_right, height=delta_y, alpha=0.5,
                  color="tab:orange", label="0.55 UI")
-    sigma_eff = out.get("sigma_G_mV", out.get("R_mV", None))
+    sigma_eff = next((out[k] for k in ("sigma_G_mV", "sigma_G_mW", "R_mV", "R_mW")
+                      if out.get(k) is not None), None)
     if sigma_eff is None:
         sigma_eff = float("nan")
     scale = max(float(F_left.max()), float(F_right.max()), 1e-12)
     if np.isfinite(float(sigma_eff)) and float(sigma_eff) > 0:
-        for pth in (p_th1, p_th2, p_th3):
+        for pth in ov["pth"]:
             kernel = np.exp(-0.5 * ((y_bins - pth) / float(sigma_eff)) ** 2)
             ax_hist.plot(kernel * scale, y_bins, "k--", lw=0.8, alpha=0.55,
-                         label="Gaussian kernel" if pth == p_th1 else None)
-    for i, pth in enumerate((p_th1, p_th2, p_th3)):
+                         label="Gaussian kernel" if pth == ov["pth"][0] else None)
+    for i, pth in enumerate(ov["pth"]):
         ax_hist.axhline(pth, color="red", lw=0.8, ls="--", alpha=0.45,
                         label="Decision thresholds" if i == 0 else None)
     ax_hist.set_ylim(ax1.get_ylim())
@@ -434,8 +508,8 @@ def make_diagnostic_plot(input_csv, out, png_path, rate_gbps=112,
     ax3.legend(loc="upper right", fontsize=7, framealpha=0.35)
 
     # the suptitle annotates the *reported* FFE (the measurement result), not
-    # the lightweight eye re-analysis: main tap bold, bound-touching taps
-    # underlined / overlined when the bounded mode is enabled.
+    # the lightweight eye re-analysis.  Portable ASCII markers avoid remote
+    # Matplotlib mathtext incompatibilities: M=main, LB/UB=bound contact.
     w_disp = np.asarray(out.get("tap_weights") or w, dtype=float)
     main_idx = int(out.get("ffe_pre_cursor", ffe_pre_cursor))
     bounds_on = bool(out.get("ffe_bounds_enabled", False))

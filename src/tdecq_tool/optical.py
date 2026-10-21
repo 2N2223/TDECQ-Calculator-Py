@@ -1,6 +1,11 @@
 # -*- coding: utf-8 -*-
 """Optical-domain signal conditioning (SPEC.md 4.6).
 
+Standard measurement mode uses :func:`reference_receiver_bt4` (the IEEE
+802.3 TDECQ 4th-order Bessel-Thomson reference receiver, 0.5 x baud) and no
+dispersion model.  :func:`optical_process` below is the LEGACY front end,
+kept only so ``tdecq_mode='legacy'`` reproduces the historical results.
+
 For TDECQ the received optical waveform (in mW) is processed with the IEEE
 802.3 receiver model:
 
@@ -97,3 +102,47 @@ def optical_process(v: np.ndarray, dt: float = None, spu: int = ANALYSIS_SPU,
             "dispersion delay, have %d)" % (n_ui, end, transient_ui, D,
                                             len(y)))
     return y[start:end]
+
+
+# ---------------------------------------------------------------------------
+# IEEE 802.3 TDECQ reference receiver (standard measurement mode)
+# ---------------------------------------------------------------------------
+REF_RX_BW_OVER_BAUD = 0.5
+
+
+def reference_receiver_bt4(v: np.ndarray, spu: int,
+                           bw_over_baud: float = REF_RX_BW_OVER_BAUD
+                           ) -> np.ndarray:
+    """4th-order Bessel-Thomson reference receiver.
+
+    The TDECQ reference receiver is a fourth-order Bessel-Thomson response
+    whose 3 dB bandwidth is ``bw_over_baud`` times the signalling rate
+    (0.5 x baud, e.g. 26.5625 GHz at 53.125 GBd).  It is applied to the
+    uniformly sampled optical waveform (``spu`` samples per UI) as a
+    magnitude-normalised digital Bessel filter; at the analysis resolution
+    (fc/fs = 0.5/spu) the bilinear frequency warping is negligible.  The
+    filter state is initialised to the first sample so the record start
+    does not produce a step transient.  Chromatic dispersion is NOT a
+    receiver property and is not modelled here (it belongs to the test
+    fibre / channel, i.e. to the waveform itself).
+
+    Parameters
+    ----------
+    v : uniformly sampled waveform.
+    spu : samples per UI.
+    bw_over_baud : 3 dB bandwidth in units of the symbol rate.
+
+    Returns
+    -------
+    np.ndarray, same length as ``v`` (delayed by the BT4 group delay,
+    about 0.67 UI at 0.5 x baud; the pattern alignment absorbs it).
+    """
+    from scipy.signal import bessel, sosfilt, sosfilt_zi
+    v = np.asarray(v, dtype=float)
+    fc = float(bw_over_baud)
+    if not 0.0 < fc < 0.5 * int(spu):
+        raise ValueError("reference receiver bandwidth %.3g x baud is not "
+                         "representable at %d samples/UI" % (fc, int(spu)))
+    sos = bessel(4, fc, btype="low", norm="mag", output="sos", fs=float(spu))
+    y, _ = sosfilt(sos, v, zi=sosfilt_zi(sos) * v[0])
+    return y

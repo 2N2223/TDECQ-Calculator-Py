@@ -57,7 +57,9 @@ from . import eq
 from . import ffe_bounds as fb
 from . import patterns
 from . import seed_diag
-from .optical import DT_112, N_UI_KEEP, RX_BW_HZ, optical_process
+from . import standards
+from .optical import (DT_112, N_UI_KEEP, REF_RX_BW_OVER_BAUD, RX_BW_HZ,
+                      optical_process, reference_receiver_bt4)
 
 
 def _ascii_text(value):
@@ -213,7 +215,8 @@ DC_REMOVE_MIN_REL = 0.2
 DC_REMOVE_MIN_OMA = 1.0    # mV-scale electrical records only (optical OMA < 1)
 
 
-def _normalize_input_prbsn(v, spu, n, taps, nom):
+def _normalize_input_prbsn(v, spu, n, taps, nom, symbol_map=None,
+                           allow_flip=True):
     """Adapt polarity inversion and DC bias on a resampled PRBSn waveform.
 
     Runs before any decode / seed recovery / equalisation.  Returns
@@ -238,15 +241,27 @@ def _normalize_input_prbsn(v, spu, n, taps, nom):
     order = sorted(range(spu), key=lambda p: min((p - cdr) % spu,
                                                  (cdr - p) % spu))
     cons_dir = cons_inv = 0.0
+    smap = None if symbol_map is None else np.asarray(symbol_map, np.int64)
     for phase in order[:PRBSN_POLARITY_PHASES]:
         for thr in thr_sets:
             sym = patterns.decode_levels(flat[phase::spu], thr)
-            bits = patterns.unpack_symbols(sym)
+            if smap is None:
+                bits = patterns.unpack_symbols(sym)
+                bits_inv = 1 - bits
+            else:
+                # level-mapped patterns (802.3 Gray PRBSnQ): an inverted
+                # waveform is the level mirror 3-p, which is not a plain bit
+                # complement under Gray coding
+                bits = patterns.unpack_symbols(smap[sym])
+                bits_inv = patterns.unpack_symbols(smap[3 - sym])
             cons_dir = max(cons_dir,
                            patterns.verify_prbs_bits(bits, int(n), taps))
             cons_inv = max(cons_inv,
-                           patterns.verify_prbs_bits(1 - bits, int(n), taps))
-    if cons_inv > PRBSN_POLARITY_MIN_CONS and \
+                           patterns.verify_prbs_bits(bits_inv, int(n), taps))
+    # ``allow_flip=False``: the level maps already include the inverted
+    # reading (PRBSnQ / user-defined polynomials), so the waveform keeps its
+    # physical sign (an optical power must never be negated)
+    if allow_flip and cons_inv > PRBSN_POLARITY_MIN_CONS and \
             cons_inv > cons_dir + PRBSN_POLARITY_MARGIN:
         flat = -flat
         info["polarity_flipped"] = True
@@ -940,10 +955,61 @@ def _main_row_feasible(row, anchor_pre):
     return ok
 
 
+def _prefilter_bounded_rows(rows, limit=24):
+    """Cheap, order-independent prefilter before expensive sigma fitting.
+
+    Preserve the lowest-SER/thinnest-lid and lowest-complexity rows from every
+    FFE geometry, plus every progressive-CD row, then fill the remaining
+    budget globally.  Lid thickness alone is intentionally not dominant:
+    it omits Ceq and distribution tails, so the full TDECQ score remains the
+    final authority.  The previous
+    stable sort by ``(SER, N, main_index)`` kept the first generated rows when
+    many open-eye candidates tied at zero errors; later eye-optimised and
+    progressive candidates could therefore be discarded without ever having
+    their TDECQ evaluated.
+    """
+    rows = list(rows)
+    if not rows or int(limit) <= 0:
+        return []
+    by_geom = {}
+    for row in rows:
+        by_geom.setdefault((int(row["N"]), int(row["m"])), []).append(row)
+    selected = []
+    selected_ids = set()
+
+    def add(row):
+        if id(row) not in selected_ids:
+            selected.append(row)
+            selected_ids.add(id(row))
+
+    # Metric-directed progressive candidates are rare (normally one) and
+    # must not be lost to a cheap proxy prefilter.
+    for row in rows:
+        if str(row.get("fam", "")).startswith("progressive_cd"):
+            add(row)
+    for key in sorted(by_geom):
+        thin = min(by_geom[key], key=lambda r: (
+            int(r["ne"]), float(r.get("lid_thickness", float("inf"))),
+            float(r.get("dffe", float("inf")))))
+        simple = min(by_geom[key], key=lambda r: (
+            int(r["ne"]), float(r.get("dffe", float("inf"))),
+            float(r.get("lid_thickness", float("inf")))))
+        add(thin)
+        add(simple)
+    remaining = sorted(
+        (row for row in rows if id(row) not in selected_ids),
+        key=lambda r: (
+            int(r["ne"]), float(r.get("lid_thickness", float("inf"))),
+            float(r.get("dffe", float("inf"))), int(r["N"]), int(r["m"])))
+    selected.extend(remaining[:max(0, int(limit) - len(selected))])
+    return selected[:int(limit)]
+
+
 def _run_bounded_pool(v, spu, n_ui, n_sym, Mj_main, ffe_pre_cursor, ffe_post_cursor,
                       tru_by_off, chosen, cdr0, nom, domain_grp, closed_eye,
                       off0=None, ptype=None, force=False, verbose=False,
-                      threshold_mode="linear"):
+                      threshold_mode="linear", b1_unbounded_enabled=False,
+                      lock_geometry=False):
     """IEEE 802.3dj-style bounded multi-tap FFE candidate pool.
 
     Opt-in branch (``analyze(..., ffe_bounds_enabled=True)``).  Evaluates the
@@ -1008,9 +1074,17 @@ def _run_bounded_pool(v, spu, n_ui, n_sym, Mj_main, ffe_pre_cursor, ffe_post_cur
     m0 = fb.main_index_from_pulse(v, spu, tru_full, nom, cdr0)
     cap_frac = ((CLOSED_CAP_O112 if domain_grp == "o112"
                  else CLOSED_CAP_V128) if closed_eye else ID_FEAS_FRAC)
+    # Explicit-geometry lock: an explicitly requested (N, main-tap) pair is
+    # binding - the pool evaluates ONLY that geometry and can never silently
+    # replace it with an auto-selected tap count / main-tap position.
+    if lock_geometry:
+        geometries = [(int(ffe_pre_cursor) + 1 + int(ffe_post_cursor),
+                       int(ffe_pre_cursor))]
+    else:
+        geometries = fb.pool_geometries(fb.FFE_BOUNDS.N_candidates,
+                                        ffe_pre_cursor, ffe_post_cursor, m0)
     rows = []
-    for N, m in fb.pool_geometries(fb.FFE_BOUNDS.N_candidates,
-                                   ffe_pre_cursor, ffe_post_cursor, m0):
+    for N, m in geometries:
         if N > n_ui:
             continue
         n_sym_N = min(n_ui - (N - 1), len(tru_full))
@@ -1027,15 +1101,49 @@ def _run_bounded_pool(v, spu, n_ui, n_sym, Mj_main, ffe_pre_cursor, ffe_post_cur
             X = Mj_N[:, :, cdr].T
             y = nom[np.asarray(tru_N, dtype=int)]
             w_un = eq.mmse_taps(Mj_N, cdr, tru_N, nom)
+            lb_un, ub_un = fb.bounds_for(len(w_un), m)
+            un_mask = ((w_un < lb_un - fb.FFE_BOUNDS.box_tol) |
+                       (w_un > ub_un + fb.FFE_BOUNDS.box_tol))
+            un_count = int(np.sum(un_mask))
+            un_total = int(len(w_un))
+            un_severity = float(max(
+                np.max(np.maximum(lb_un - w_un, 0.0)),
+                np.max(np.maximum(w_un - ub_un, 0.0))))
             fea_un, _ = fb.check_feasible(w_un, m)
             cands = []
             if fea_un:
                 cands.append(("mmse_un", w_un, m))
             cands.append(("bounded_qp", fb.solve_bounded_qp(X, y, m), m))
+            cands.append(("eye_lid_qp",
+                          fb.solve_eye_lid_qp(Mj_N, tru_N, nom, cdr, spu, m),
+                          m))
             cands.append(("active_set", fb.solve_active_set(X, y, m), m))
             for a in (0.25, 0.5, 0.75):
                 cands.append(("damped_%.2f" % a,
                               fb.solve_damped(X, y, m, a), m))
+            # One-tap DFE candidates.  OMA is measured at the FFE input and
+            # the feedback is the known aligned symbol x(n-1), never a hard
+            # decision.  Conditional fixed-b1 solves jointly re-fit all FFE
+            # taps; the additional joint-QP candidate optimises b1 itself.
+            if N in (5, 7):
+                in_lv = eq.levels_at(Mj_N[m], tru_N, cdr)
+                oma_in = float(in_lv[3] - in_lv[0])
+                if not np.isfinite(oma_in) or oma_in <= 1e-12:
+                    oma_in = float(nom[3] - nom[0])
+                feedback = fb.pam4_feedback(tru_N, oma_in)
+                for bgrid in fb.FFE_BOUNDS.b1_candidates[1:]:
+                    bval = (fb.FFE_BOUNDS.b1_max - fb.FFE_BOUNDS.b1_open_margin
+                            if bgrid >= fb.FFE_BOUNDS.b1_max else float(bgrid))
+                    w_b = fb.solve_bounded_qp(X, y + bval * feedback, m,
+                                              b1=bval)
+                    cands.append(("bounded_qp_dfe", w_b, m, bval, feedback))
+                w_j, b_j = fb.solve_joint_bounded_qp(X, y, feedback, m)
+                cands.append(("joint_qp_dfe", w_j, m, b_j, feedback))
+                if b1_unbounded_enabled:
+                    w_u, b_u = fb.solve_joint_bounded_qp(
+                        X, y, feedback, m, b1_unbounded=True)
+                    cands.append(("joint_qp_b1_unbounded", w_u, Mj_N,
+                                  tru_N, n_sym_N, m, b_u, feedback, True))
             if (cdr == cdr_c and N == fb.FFE_BOUNDS.N_candidates[0]
                     and m == int(np.clip(m0, 0, fb.FFE_BOUNDS.max_pre))
                     and n_sym_N <= 8192):
@@ -1047,33 +1155,74 @@ def _run_bounded_pool(v, spu, n_ui, n_sym, Mj_main, ffe_pre_cursor, ffe_post_cur
                 pcd = fb.progressive_cd(v, spu, n_ui, tru_full, cdr, m,
                                         max_N=fb.FFE_BOUNDS.N_candidates[-1],
                                         decimate=8,
-                                        threshold_mode=threshold_mode)
+                                        threshold_mode=threshold_mode,
+                                        dfe_oma=oma_in)
                 if pcd is not None:
-                    wN, Nf = pcd
+                    wN, Nf, bN = pcd
                     mf = int(m) + (Nf - N) // 2
                     nf = min(n_ui - (Nf - 1), len(tru_full))
                     if nf >= fb.FFE_BOUNDS.min_sym:
                         Mj_f = eq.build_Mj(v, spu, nf, mf, Nf - 1 - mf)
                         tru_f = np.asarray(tru_full[:nf])
                         wN = np.asarray(wN, dtype=float)
+                        feedback_f = fb.pam4_feedback(tru_f, oma_in)
                         cands.append(("progressive_cd", wN,
-                                      Mj_f, tru_f, nf, mf))
+                                      Mj_f, tru_f, nf, mf, bN, feedback_f))
             for entry in cands:
+                b1 = 0.0
+                feedback_e = None
+                b1_unbounded = False
                 if len(entry) == 3:
                     name, w, mw = entry
                     Mj_e, tru_e, ns_e = Mj_N, tru_N, n_sym_N
-                else:
+                elif len(entry) == 5:
+                    name, w, mw, b1, feedback_e = entry
+                    Mj_e, tru_e, ns_e = Mj_N, tru_N, n_sym_N
+                elif len(entry) == 6:
                     name, w, Mj_e, tru_e, ns_e, mw = entry
+                elif len(entry) == 8:
+                    name, w, Mj_e, tru_e, ns_e, mw, b1, feedback_e = entry
+                else:
+                    name, w, Mj_e, tru_e, ns_e, mw, b1, feedback_e, \
+                        b1_unbounded = entry
                 w = np.asarray(w, dtype=float)
                 Nw, mw = len(w), int(mw)
+                if Nw == N and mw == m:
+                    un_count_e = un_count
+                    un_total_e = un_total
+                    un_severity_e = un_severity
+                else:
+                    # Progressive expansion may return a different geometry;
+                    # report the unconstrained baseline for that exact
+                    # selected geometry, not an aggregate over the pool.
+                    w_un_e = eq.mmse_taps(Mj_e, cdr, tru_e, nom)
+                    lb_e, ub_e = fb.bounds_for(Nw, mw)
+                    mask_e = ((w_un_e < lb_e - fb.FFE_BOUNDS.box_tol) |
+                              (w_un_e > ub_e + fb.FFE_BOUNDS.box_tol))
+                    un_count_e = int(np.sum(mask_e))
+                    un_total_e = int(Nw)
+                    un_severity_e = float(max(
+                        np.max(np.maximum(lb_e - w_un_e, 0.0)),
+                        np.max(np.maximum(w_un_e - ub_e, 0.0))))
                 M = np.tensordot(Mj_e, w, axes=(0, 0))
+                if b1 > 0.0:
+                    M = M - b1 * np.asarray(feedback_e)[:, None]
                 ne = eq.count_errors(M, tru_e, cdr)
                 dffe = float(np.abs(w - eq.identity_taps(
                     mw, Nw - 1 - mw)).sum())
                 ceq = float(np.sqrt((w ** 2).sum()))
+                lid_thickness = eq.eye_lid_thickness(
+                    M, tru_e, cdr, spu)
                 base = name.rsplit("_N%d_m%d" % (Nw, mw), 1)[0]
                 rows.append(dict(N=Nw, m=mw, cdr=cdr, off=off, w=w,
                                      ne=int(ne), dffe=dffe, ceq=ceq,
+                                     lid_thickness=float(lid_thickness),
+                                     b1=float(b1), feedback=feedback_e,
+                                     b1_unbounded=bool(b1_unbounded),
+                                     oma_input=(None if feedback_e is None else oma_in),
+                                     un_over=un_count_e,
+                                     un_total=un_total_e,
+                                     un_severity=un_severity_e,
                                      fam="%s_N%d_m%d" % (base, Nw, mw),
                                      tru=tru_e, Mj=Mj_e, n_sym=ns_e))
     # Structural gate: only anchored, box-feasible rows may leave the pool.
@@ -1081,11 +1230,16 @@ def _run_bounded_pool(v, spu, n_ui, n_sym, Mj_main, ffe_pre_cursor, ffe_post_cur
     # declared anchor (or violates the relative-offset bounds) is not a
     # candidate - the reported operating point must satisfy the
     # 802.3dj-style bounds at its declared main tap.
-    rows = [r for r in rows if fb.check_feasible(r["w"], r["m"])[0]]
+    rows = [r for r in rows if fb.check_feasible(
+        r["w"], r["m"], b1=r.get("b1", 0.0),
+        b1_unbounded=r.get("b1_unbounded", False))[0]]
     if not rows:
         return None
     cap = max(1, int(cap_frac * n_sym))
     feasible = [r for r in rows if r["ne"] <= cap]
+    # Manifest-preserving gate: whenever a zero-error no-DFE solution exists,
+    # DFE candidates are ineligible regardless of their lower metric.
+    feasible = fb.manifest_compatible_dfe_gate(feasible)
     _closed_fallback = False
     if not feasible:
         # Strictly closed records (e.g. the real LC-resonant rc50 channels
@@ -1107,20 +1261,9 @@ def _run_bounded_pool(v, spu, n_ui, n_sym, Mj_main, ffe_pre_cursor, ffe_post_cur
     # computed only for the top-ranked rows, which decides the reported sigma
     # method for the non-overridden classes.  The final reported metrics are
     # recomputed at full precision by the caller.
-    feasible.sort(key=lambda r: (r["ne"], r["N"], r["m"]))
-    # Every geometry (N, m) - in particular the CLI-requested geometry -
-    # keeps its best rows in the scoring pool, so a higher-tap candidate is
-    # never silently excluded by the cheap (ne, N, m) ordering.
-    by_geom = {}
-    for r in feasible:
-        by_geom.setdefault((r["N"], r["m"]), []).append(r)
-    pool = []
-    for key in sorted(by_geom):
-        pool.extend(sorted(by_geom[key], key=lambda r: r["ne"])[:2])
-    if len(pool) < 24:
-        seen = {id(r) for r in pool}
-        pool.extend(r for r in feasible if id(r) not in seen)
-    pool = pool[:24]
+    # Pre-rank by a cheap direct eye-lid measurement.  This is only a compute
+    # budget filter; final selection below still uses full hist/sample TDECQ.
+    pool = _prefilter_bounded_rows(feasible, limit=48)
     rank_method = ("hist_ieee"
                    if (is_prbs13_dual(ptype) and domain_grp == "v128"
                        and closed_eye)
@@ -1134,12 +1277,18 @@ def _run_bounded_pool(v, spu, n_ui, n_sym, Mj_main, ffe_pre_cursor, ffe_post_cur
         return fb.FFE_BOUNDS.lam_taps * max(0, int(N) - 5)
 
     def _score_hist(r):
+        dfe_penalty = (fb.FFE_BOUNDS.lam_dfe_unbounded
+                       if r.get("b1_unbounded", False)
+                       else fb.FFE_BOUNDS.lam_dfe)
         return (r["m_hist"] + fb.FFE_BOUNDS.lam_dffe * r["dffe"]
                 + fb.FFE_BOUNDS.lam_ceq * r["ceq"]
-                + _tap_penalty(r["N"]))
+                + _tap_penalty(r["N"])
+                + dfe_penalty * (r.get("b1", 0.0) > 0.0))
 
     for r in pool:
         M = np.tensordot(r["Mj"], r["w"], axes=(0, 0))
+        if r.get("b1", 0.0) > 0.0:
+            M = M - r["b1"] * np.asarray(r["feedback"])[:, None]
         mh, _ = eq.metric_detail(M, r["w"], r["tru"], r["cdr"], spu,
                                  rank_method, threshold_mode=threshold_mode)
         r["m_hist"] = float(mh)
@@ -1148,6 +1297,8 @@ def _run_bounded_pool(v, spu, n_ui, n_sym, Mj_main, ffe_pre_cursor, ffe_post_cur
     top = pool[:4]
     for r in top:
         M = np.tensordot(r["Mj"], r["w"], axes=(0, 0))
+        if r.get("b1", 0.0) > 0.0:
+            M = M - r["b1"] * np.asarray(r["feedback"])[:, None]
         ms, _ = eq.metric_detail(M, r["w"], r["tru"], r["cdr"], spu, "samp",
                                  threshold_mode=threshold_mode)
         r["m_samp"] = float(ms)
@@ -1158,9 +1309,13 @@ def _run_bounded_pool(v, spu, n_ui, n_sym, Mj_main, ffe_pre_cursor, ffe_post_cur
         # the histogram only
         m = (min(r["m_samp"], r["m_hist"]) if r["m_samp"] is not None
              else r["m_hist"])
+        dfe_penalty = (fb.FFE_BOUNDS.lam_dfe_unbounded
+                       if r.get("b1_unbounded", False)
+                       else fb.FFE_BOUNDS.lam_dfe)
         return (m + fb.FFE_BOUNDS.lam_dffe * r["dffe"]
                 + fb.FFE_BOUNDS.lam_ceq * r["ceq"]
-                + _tap_penalty(r["N"]))
+                + _tap_penalty(r["N"])
+                + dfe_penalty * (r.get("b1", 0.0) > 0.0))
 
     # main-path reference score (same full-precision metrics / penalties)
     cw = np.asarray(chosen["w"])
@@ -1173,6 +1328,9 @@ def _run_bounded_pool(v, spu, n_ui, n_sym, Mj_main, ffe_pre_cursor, ffe_post_cur
     ident_m = eq.identity_taps(ffe_pre_cursor, ffe_post_cursor)
     dffe_m = float(np.abs(cw - ident_m).sum())
     ceq_m = float(np.sqrt((cw ** 2).sum()))
+    lid_main = float(eq.eye_lid_thickness(Mch, Mt, cdr_c, spu))
+    if not np.isfinite(lid_main):
+        lid_main = 1e9
     score_main = (min(ms_m, mh_m) + fb.FFE_BOUNDS.lam_dffe * dffe_m
                   + fb.FFE_BOUNDS.lam_ceq * ceq_m
                   + _tap_penalty(Mj_main.shape[0]))
@@ -1198,18 +1356,30 @@ def _run_bounded_pool(v, spu, n_ui, n_sym, Mj_main, ffe_pre_cursor, ffe_post_cur
               ne=best["ne"], m_hist=best["m_hist"], m_samp=best["m_samp"],
               dffe=best["dffe"], ceq=best["ceq"], method=method,
               tier="ffe-bounded")
+    ch["b1"] = float(best.get("b1", 0.0))
+    ch["b1_unbounded"] = bool(best.get("b1_unbounded", False))
+    ch["dfe_feedback"] = best.get("feedback")
+    ch["oma_input"] = best.get("oma_input")
     info = dict(N=best["N"], m=best["m"], fam=best["fam"],
+                b1=float(best.get("b1", 0.0)),
+                b1_unbounded=bool(best.get("b1_unbounded", False)),
+                ffe_unconstrained_overlimit_count=int(best["un_over"]),
+                ffe_unconstrained_tap_total=int(best["un_total"]),
+                ffe_unconstrained_max_severity=float(best["un_severity"]),
+                eye_lid_thickness=float(best["lid_thickness"]),
+                eye_lid_main=float(lid_main),
                 at_bound=fb.at_bound_info(best["w"], best["m"]),
                 score_bounded=float(score_b), score_main=float(score_main),
                 n_feasible=len(feasible), n_evaluated=len(rows),
                 forced=bool(force))
     if verbose:
         print("    bounded-FFE: %s  N=%d m=%d  %s=%.4f ser=%.4g "
-              "(score %.4f vs %.4f)" %
+              "lid=%.4g (score %.4f vs %.4f)" %
               (best["fam"], best["N"], best["m"],
                "tecq" if domain_grp != "o112" else "tdecq",
                min(best["m_hist"], best["m_samp"]),
-               best["ne"] / best["n_sym"], score_b, score_main))
+               best["ne"] / best["n_sym"], best["lid_thickness"],
+               score_b, score_main))
     return dict(chosen=ch, info=info, pre=best["m"],
                 post=best["N"] - 1 - best["m"], n_sym=best["n_sym"],
                 Mj=best["Mj"], tru=best["tru"])
@@ -1269,6 +1439,11 @@ def _align_ssprq_adaptive(Mj, n_sym, spu, n_pre=0):
     from physical class to SSPRQ symbol, and use circular correlation against
     the official 65535-symbol sequence.  The returned truth is kept in the
     physical class order so downstream voltage metrics remain monotonic.
+
+    When the raw-clustered decode match is poor (strong ISI closes the eye
+    so no phase decodes usefully), a second pass retries with an MMSE
+    equalisation toward the waveform's own clustered levels at each phase
+    (seed-independent, like :func:`_enhanced_prbsn_recovery`).
     """
     ps = patterns.ssprq_symbols()
     best = (-1.0, 0, (0, 1, 2, 3), None, 0)
@@ -1291,6 +1466,34 @@ def _align_ssprq_adaptive(Mj, n_sym, spu, n_pre=0):
             acc = float((logical[:n_probe] == ref_logical).mean())
             if acc > best[0]:
                 best = (acc, int(phase), tuple(mapping), centers.copy(), int(off))
+    if best[0] < 0.60:
+        # ---- equalised retry: decode the MMSE-equalised eye per phase ----
+        flat = Mj[n_pre].ravel()
+        cdr0 = eq.cdr_from_crossing(flat, spu)
+        order = sorted(range(spu), key=lambda p: min((p - cdr0) % spu,
+                                                     (cdr0 - p) % spu))
+        for phase in order[:min(int(spu), ENH_PHASE_LIMIT)]:
+            dec, _lv = _equalized_decode_at(Mj, n_pre, phase,
+                                            n_sym=n_probe)
+            if dec is None or len(dec) < n_probe:
+                continue
+            for mapping in map_candidates:
+                logical = np.asarray(mapping, dtype=np.int64)[dec]
+                off = patterns.align_symbols_fft(logical, ps, len(ps))
+                ref_logical = ps[(np.arange(len(logical)) + off) % len(ps)]
+                acc = float((logical == ref_logical).mean())
+                if acc > best[0]:
+                    centers = _adaptive_pam4_levels(
+                        np.asarray(Mj[n_pre, :, phase], dtype=float))
+                    best = (acc, int(phase), tuple(mapping), centers, int(off))
+                    if acc >= 0.995:
+                        break
+            if best[0] >= 0.995:
+                break
+        if best[0] > 0.60:
+            seed_diag.emit("ssprq_alignment", result="equalized_retry",
+                           match_fraction=float(best[0]),
+                           phase=int(best[1]))
     acc, phase, mapping, centers, off = best
     inv = np.empty(4, dtype=np.int64)
     for physical, logical in enumerate(mapping):
@@ -1330,6 +1533,12 @@ def parse_prbsn(pattern):
     :func:`validate_pattern_request` before this helper is reached.
     """
     s = str(pattern or "").strip().lower()
+    c = patterns.parse_custom_prbs_name(s, strict=False)
+    if c is not None:
+        return c[0], c[1]
+    q = patterns.parse_prbsq_name(s)
+    if q is not None:
+        return q
     if not s.startswith("prbs"):
         return None
     rest = s[4:]
@@ -1354,11 +1563,16 @@ def validate_pattern_request(pattern, prbs_order=None):
             "through 'prbs31', or 'prbs13dual' for the two-plane mode" % s)
     if s in ("auto", "ssprq", PATTERN_PRBS13_DUAL):
         return s
+    # user-defined polynomial: malformed / non-primitive input raises here
+    c = patterns.parse_custom_prbs_name(s, strict=True)
+    if c is not None:
+        return patterns.custom_prbs_name(*c)
     if parse_prbsn(s) is not None:
         return s
     raise ValueError(
-        "unsupported pattern %r; use auto, ssprq, prbs2..prbs31, or "
-        "prbs13dual" % pattern)
+        "unsupported pattern %r; use auto, ssprq, prbs2..prbs31, prbs13q, "
+        "prbs31q, prbs13dual, or a custom polynomial prbs:<poly> / "
+        "prbsq:<poly> (Gray), e.g. prbs:x^13+x^12+x^10+x^9+1" % pattern)
 
 # ---------------------------------------------------------------------------
 # pattern / alignment helpers
@@ -1397,6 +1611,9 @@ def resolve_pattern(pattern, header=""):
         return "ssprq"
     if PATTERN_PRBS13_DUAL in low:
         return PATTERN_PRBS13_DUAL
+    for qname in ("prbs13q", "prbs31q"):
+        if qname in low:
+            return qname
     if "prbs13" in low:
         return "prbs13"
     return None  # caller decides from record length / decode match
@@ -1450,6 +1667,17 @@ def align_elec_112(Mj, ptype, n_sym, period, nom, refine=True, n_pre=0):
     thr0 = [(nom[0] + nom[1]) / 2, (nom[1] + nom[2]) / 2, (nom[2] + nom[3]) / 2]
     ps = patterns.pattern_symbols(ptype, period)
     cdr_ref = eq.cdr_from_crossing(Mj[n_pre].ravel(), spu)
+    # Bit-domain patterns need the full phase sweep (the bit correlation is
+    # cheap per phase and the symbol phase matters).  FFT-aligned periodic
+    # patterns (SSPRQ) pay a full-period FFT set per phase; the circular
+    # offset is phase-independent for a correct decode, so the phases nearest
+    # the CDR are sufficient and the sweep cost drops ~6x.
+    if ptype in ("prbs11", "prbs31") or patterns._parse_prbsn_name(ptype) is not None:
+        phase_list = range(spu)
+    else:
+        phase_list = sorted(range(spu),
+                            key=lambda p: min((p - cdr_ref) % spu,
+                                              (cdr_ref - p) % spu))[:5]
     # scan: (acc, -identity_SER, -cdr_distance, cdr, off).  Ranking by acc
     # first and identity-eye SER second makes the PRBS bit-phase phantom
     # (a full-bit-period shift that ties in the circular correlation but
@@ -1465,7 +1693,7 @@ def align_elec_112(Mj, ptype, n_sym, period, nom, refine=True, n_pre=0):
         # deterministically and independently of float rounding / numpy
         # version.
         out = []
-        for cdr in range(spu):
+        for cdr in phase_list:
             dec = patterns.decode_levels(Mj[n_pre, :, cdr], thr)
             g = patterns._parse_prbsn_name(ptype)
             if ptype in ("prbs11", "prbs31") or g is not None:
@@ -1876,11 +2104,19 @@ def _detect_pattern_112(Mj, n_sym, spu, nom, domain, n_pre=0):
     # PRBSn: automatic seed-recovery scoring.  Common orders plus the release
     # names; only candidates whose LFSR state is recovered from the waveform
     # are credited.
+    # Fast path: the expensive dimension of the raw scan is the 24-level-map
+    # breadth x GF(2) work, so auto-detection first runs every order with the
+    # identity level map over ALL phases (cheap screen, lightweight failure).
+    # Only when no order recovers does the second pass widen the map set
+    # (Gray-equivalent relabelings) and arm the equalised-retry tier
+    # (heavy-ISI records).
     for n in (31, 11, 13, 15, 16, 9, 7):
         taps = patterns.prbsn_taps(n)
         try:
             res = align_prbsn(Mj, n, spu, nom, n_sym, taps, n_pre=n_pre,
-                              n_sym=n_sym)
+                              n_sym=n_sym, enhanced=False,
+                              map_mode="identity",
+                              light_fallback=True)
         except Exception:
             continue
         if not res[6]:
@@ -1888,6 +2124,24 @@ def _detect_pattern_112(Mj, n_sym, spu, nom, domain, n_pre=0):
         acc = float(res[2])
         if acc > best[0]:
             best = (acc, "prbs%d" % n)
+    if best[1] == "ssprq" and best[0] < 0.99:
+        # no conclusive recovery/SSPRQ match: rerun the orders that failed
+        # with the widened scan + equalised-retry tier.
+        for n in (31, 11, 13, 15, 16, 9, 7):
+            taps = patterns.prbsn_taps(n)
+            try:
+                res = align_prbsn(Mj, n, spu, nom, n_sym, taps, n_pre=n_pre,
+                                  n_sym=n_sym, enhanced=True,
+                                  enh_phase_limit=9, map_mode="gray",
+                                  light_fallback=True)
+            except Exception:
+                continue
+            if not res[6]:
+                continue
+            acc = float(res[2])
+            if acc > best[0]:
+                best = (acc, "prbs%d" % n)
+                break
     return best[1]
 
 
@@ -1896,7 +2150,47 @@ def _detect_pattern_112(Mj, n_sym, spu, nom, domain, n_pre=0):
 # ---------------------------------------------------------------------------
 
 
-def _fold_period(n):
+def _prbsn_opts(pattern, release_fold=True):
+    """Recovery options of a single-LFSR pattern name.
+
+    802.3 Gray-coded ``prbs13q``/``prbs31q`` force the Gray level map (no
+    24-permutation scan, no alternate PRBS13 tap convention) and never use
+    the release 2047-symbol PRBS31 fold.  ``release_fold=False`` (standard
+    measurement mode) treats ``prbs31`` as the true linear 2**31-1 stream.
+    """
+    c = patterns.parse_custom_prbs_name(pattern, strict=False)
+    if c is not None:
+        # user-defined polynomial: exactly the requested taps and level map
+        # (binary or Gray, plus its polarity-inverted reading); no
+        # permutation scan, no alternate PRBS13 taps, no release fold
+        m = tuple(patterns.GRAY_PHYS_TO_LOGICAL) if c[2] else (0, 1, 2, 3)
+        return dict(symbol_maps=(m, tuple(m[3 - k] for k in range(4))),
+                    release_fold=False,
+                    pattern_name=patterns.custom_prbs_name(*c))
+    q = patterns.parse_prbsq_name(pattern)
+    if q is not None:
+        m = tuple(patterns.GRAY_PHYS_TO_LOGICAL)
+        return dict(symbol_maps=(m, tuple(m[3 - k] for k in range(4))),
+                    release_fold=False,
+                    pattern_name=str(pattern).strip().lower())
+    return dict(symbol_maps=None, release_fold=bool(release_fold),
+                pattern_name=None)
+
+
+def _forced_map_label(symbol_maps, used):
+    """Readable level-map label for PRBSnQ / user-defined polynomials."""
+    used = tuple(used) if used is not None else tuple(symbol_maps[0])
+    gray = tuple(symbol_maps[0]) == tuple(patterns.GRAY_PHYS_TO_LOGICAL)
+    base = ("IEEE 802.3 Gray (00,01,11,10 -> levels 0..3)" if gray
+            else "binary (00,01,10,11 -> levels 0..3)")
+    if used == tuple(symbol_maps[0]):
+        return base
+    if used == tuple(symbol_maps[0][3 - k] for k in range(4)):
+        return base + ", inverted polarity"
+    return "physical->logical %s" % (used,)
+
+
+def _fold_period(n, release_fold=True):
     """Implied fold period (symbols) used by the folded/linear discrimination.
 
     * prbs11 / prbs31 use the release folded reference period (2047 symbols);
@@ -1905,7 +2199,7 @@ def _fold_period(n):
     * higher orders (period >= 2**17) cannot be materialised - such records
       are always treated as linear segments.
     """
-    if n in (11, 31):
+    if n == 11 or (n == 31 and release_fold):
         return RELEASE_FOLD_PERIOD
     period = (1 << int(n)) - 1
     return period if period <= 65535 else None
@@ -1977,7 +2271,190 @@ def _emit_prbsn_seed_candidates(Mj, n, spu, taps, n_pre, thr_sets, cdr0,
             seed_diag.emit("prbsn_candidate", **fields)
 
 
-def align_prbsn(Mj, n, spu, nom, n_ui, taps, n_pre=0, n_sym=None):
+# ---- enhanced (equalised-retry) seed recovery --------------------------------
+# The raw-eye decode scan recovers seeds only while the raw PAM4 eye still
+# decodes better than chance somewhere.  On strongly-ISI / noisy records
+# every phase fails the exact ``recover_seed`` gate and the record used to
+# fall to the canonical reference (an honest but *unequalised* fallback).
+# The enhanced tier equalises FIRST (5-tap unit-gain MMSE toward the
+# waveform's own clustered levels - still seed-independent), re-decodes the
+# equalised eye and retries with the noise-tolerant
+# :func:`patterns.recover_seed_noisy`.  Acceptance is scored on the
+# equalised decode accuracy, and every downstream credibility gate
+# (decode-accuracy gate, equalised-SER cross-check, out-of-sample
+# validation) still applies, so a false lock remains detectable and honest.
+ENH_PHASE_LIMIT = 33        # equalised-retry phases (CDR-distance order)
+ENH_CONS_MIN = 0.62         # min regenerated-reference match on the decode
+ENH_ACC_OK = 0.66           # min equalised decoded-symbol accuracy to accept
+ENH_MATCH_OK = 0.68         # min regenerated-reference match to accept
+                            # (chance locks on 2-level ISI decodes score
+                            # ~0.60-0.65; correct recoveries >= 0.8)
+ENH_SYMBOL_MAPS_ALL = False # scan all 24 level maps only on explicit demand
+
+
+def _equalized_decode_at(Mj, n_pre, phase, n_sym=None, dd_iters=3,
+                         dfe=False):
+    """Seed-independent MMSE equalisation + PAM4 decode at one phase.
+
+    Levels are clustered from the *raw* samples (1-D k-means) to provide
+    initial hard targets; the MMSE equaliser is then refined by
+    ``dd_iters`` decision-directed iterations (re-decode the equalised eye,
+    re-fit the equaliser toward the new decisions' class means).  This is
+    the classic decision-directed startup and converges far beyond the
+    raw-cluster targets on strongly-ISI eyes.  With ``dfe`` a one-tap
+    ideal-decision feedback (b1 = first-postcursor estimate from the fitted
+    channel) is applied on top, which reopens ISI-dominated eyes that a
+    linear 5-tap cannot.
+
+    No nominal-level or seed information is used.  Returns
+    ``(dec_sym, measured_levels)`` (empty on degenerate clusters).
+    """
+    raw = np.asarray(Mj[n_pre, :, phase], dtype=float)
+    centers0 = _adaptive_pam4_levels(raw)
+    if not np.all(np.isfinite(centers0)) or centers0[3] <= centers0[0]:
+        return None, None
+    raw_dec = np.argmin(np.abs(raw[:, None] - centers0[None, :]), axis=1)
+    dec = raw_dec
+    lv = centers0
+    w = None
+    n_seg = len(raw) if n_sym is None else min(n_sym, len(raw))
+    for _it in range(max(1, int(dd_iters))):
+        try:
+            w = eq.mmse_taps(Mj, phase, dec, lv)
+        except Exception:
+            return None, None
+        M = np.tensordot(Mj, w, axes=(0, 0))
+        seg = M[:, phase] if n_sym is None else M[:n_seg, phase]
+        lv2 = _class_means_safe(seg, dec[:len(seg)])
+        if lv2 is None:
+            break
+        lv = lv2
+        thr = [(lv[0] + lv[1]) / 2, (lv[1] + lv[2]) / 2, (lv[2] + lv[3]) / 2]
+        dec2 = patterns.decode_levels(seg, thr)
+        if float((dec2 == dec[:len(seg)]).mean()) >= 0.999:
+            dec = dec2
+            break
+        dec = dec2
+    if w is None:
+        return None, None
+    M = np.tensordot(Mj, w, axes=(0, 0))
+    seg = M[:, phase] if n_sym is None else M[:n_seg, phase]
+    if dfe and len(seg) > 8:
+        # one-tap ideal-decision DFE: b(1) from the least-squares channel
+        # fit at this phase, feedback = previous decoded symbol at OMA/2.
+        try:
+            h = _channel_tap_fit(Mj, n_pre, phase, dec)
+            b1 = float(np.abs(h[1])) if len(h) > 1 else 0.0
+            oma = float(lv[3] - lv[0])
+            feedback = (0.5 * oma *
+                        np.array([-1.0, -1.0 / 3.0, 1.0 / 3.0, 1.0])[dec - 0])
+            fb = np.roll(feedback, 1)
+            seg = seg - b1 * fb
+            lv2 = _class_means_safe(seg, dec)
+            if lv2 is not None:
+                lv = lv2
+        except Exception:
+            pass
+    thr = [(lv[0] + lv[1]) / 2, (lv[1] + lv[2]) / 2, (lv[2] + lv[3]) / 2]
+    return patterns.decode_levels(seg, thr), lv
+
+
+def _channel_tap_fit(Mj, n_pre, phase, dec, L=5):
+    """Least-squares channel pulse estimate from the equalised decode."""
+    y = np.asarray(Mj[n_pre, :, phase], dtype=float)
+    x = np.asarray(dec, dtype=float)
+    n = min(len(y), len(x)) - L
+    if n < 32:
+        return np.zeros(L)
+    X = np.zeros((n, L), dtype=float)
+    for i in range(L):
+        X[i:, i] = x[:n]
+    h, _r, _rk, _sv = np.linalg.lstsq(X, y[L:L + n], rcond=None)
+    return h
+
+
+def _class_means_safe(samples, cls):
+    """Per-class means or None when any class is empty / non-finite."""
+    out = np.empty(4, dtype=float)
+    for c in range(4):
+        m = samples[cls == c]
+        if len(m) == 0:
+            return None
+        out[c] = m.mean()
+    if not np.all(np.isfinite(out)) or not (out[3] > out[0]):
+        return None
+    return out
+
+
+def _enhanced_prbsn_recovery(Mj, n, spu, taps, n_pre, n_sym,
+                             scan_all_maps=False, phase_limit=None,
+                             maps=None):
+    """Equalised-retry LFSR seed recovery for raw-decode-failed records.
+
+    For every sampling phase (CDR-distance order, bounded by
+    ``ENH_PHASE_LIMIT``) the record is MMSE-equalised toward its own
+    clustered levels, the equalised eye is decoded, and the bit stream is
+    recovered with the exact gate first and the noise-tolerant
+    :func:`patterns.recover_seed_noisy` second.  Candidates are scored by
+    the regenerated-reference match on the decoded bits; the winner must
+    also decode the equalised eye with at least ``ENH_ACC_OK`` symbol
+    accuracy.
+
+    Returns
+    -------
+    dict(match, phase, seed, s0, dec, thr_source, equalized) or None.
+    ``match`` is the decoded-bit match of the regenerated reference at the
+    winning phase; ``dec`` the equalised decoded symbols there.
+    """
+    flat = Mj[n_pre].ravel()
+    cdr0 = eq.cdr_from_crossing(flat, spu)
+    order = sorted(range(spu), key=lambda p: min((p - cdr0) % spu,
+                                                 (cdr0 - p) % spu))
+    if maps is None:
+        maps = (tuple(itertools.permutations(range(4))) if scan_all_maps
+                else ((0, 1, 2, 3),))
+    limit = (min(int(spu), ENH_PHASE_LIMIT) if phase_limit is None
+             else min(int(spu), int(phase_limit)))
+    best = None
+    for phase in order[:limit]:
+        for dfe in (False, True):
+            dec, _lv = _equalized_decode_at(Mj, n_pre, phase, dfe=dfe)
+            if dec is None or len(dec) < 2 * n + 8:
+                continue
+            for symbol_map in maps:
+                logical = _map_symbols(dec, symbol_map)
+                bits = patterns.unpack_symbols(logical)
+                res = patterns.recover_seed(bits, n, taps)
+                basis = "exact"
+                if res is None:
+                    res = patterns.recover_seed_noisy(bits, n, taps,
+                                                      match_min=ENH_CONS_MIN)
+                    basis = "noisy"
+                if res is None:
+                    continue
+                seed, _s0, match = res
+                ref_bits = patterns.lfsr_bits(seed, n, len(bits), taps)
+                ref_sym = patterns.pack_bits(ref_bits)
+                sym_match = float((logical == ref_sym).mean())
+                key = (min(sym_match, match), sym_match)
+                if best is None or key > best[0]:
+                    best = (key, dict(match=float(match), phase=int(phase),
+                                      seed=int(seed),
+                                      dec=logical,
+                                      symbol_map=tuple(symbol_map),
+                                      equalized=True, basis=basis,
+                                      dfe=bool(dfe)))
+                if best is not None and best[0][0] >= 0.995:
+                    return best[1]
+    if best is None or best[0][0] < ENH_MATCH_OK:
+        return None
+    return best[1]
+
+
+def align_prbsn(Mj, n, spu, nom, n_ui, taps, n_pre=0, n_sym=None,
+                enhanced=True, enh_phase_limit=None, map_mode=None,
+                phase_cap=None, light_fallback=False, symbol_maps=None,
+                release_fold=True):
     """Align a generic PRBSn record with automatic seed and offset recovery.
 
     Flow
@@ -2024,7 +2501,8 @@ def align_prbsn(Mj, n, spu, nom, n_ui, taps, n_pre=0, n_sym=None):
     """
     if n_sym is None:
         n_sym = n_ui - 4
-    if n == 31 and n_ui <= RELEASE_FOLD_PERIOD + 4:
+    fb_kw = dict(symbol_maps=symbol_maps, release_fold=release_fold)
+    if n == 31 and release_fold and n_ui <= RELEASE_FOLD_PERIOD + 4:
         # Release PRBS31 records measured on a single fold-period window
         # (2047 UI) are one cycle of the canonical folded reference
         # (PRBS31_BITS tiled at the 2047-symbol period).  Such a short
@@ -2039,7 +2517,7 @@ def align_prbsn(Mj, n, spu, nom, n_ui, taps, n_pre=0, n_sym=None):
         # reference by chance and must keep the linear state recovery.
         tru_f, off_f, acc_f, seed_f, s0_f, ref_f, ok_f = \
             _align_prbsn_fallback(Mj, n, spu, nom, n_ui, taps,
-                                  n_pre=n_pre, n_sym=n_sym)
+                                  n_pre=n_pre, n_sym=n_sym, **fb_kw)
         if acc_f >= PRBSN_FOLD_ACC_MIN:
             if seed_diag.enabled():
                 flat_f = Mj[n_pre].ravel()
@@ -2065,8 +2543,11 @@ def align_prbsn(Mj, n, spu, nom, n_ui, taps, n_pre=0, n_sym=None):
     thr_sets.append(("percentile_midpoint", [(lv_p[0] + lv_p[1]) / 2,
                                                (lv_p[1] + lv_p[2]) / 2,
                                                (lv_p[2] + lv_p[3]) / 2]))
-    if n == 13:
-        thr_sets.append(("adaptive_kmeans", _adaptive_pam4_thresholds(flat)))
+    # adaptive k-means thresholds for every order: percentile midpoints fail
+    # on skewed level occupancies (strong ISI pushes the percentiles toward
+    # the outer levels), while the iterated 4-class clustering tracks the
+    # actual class means.  Cheap and seed-independent.
+    thr_sets.append(("adaptive_kmeans", _adaptive_pam4_thresholds(flat)))
     # Cheap screening pass first: recover the seed at every sampling phase and
     # score the phase by its recurrence consistency; the full-length reference
     # is generated only once for the best phase (keeps long records fast).
@@ -2080,13 +2561,35 @@ def align_prbsn(Mj, n, spu, nom, n_ui, taps, n_pre=0, n_sym=None):
     # order.  Scan all four-level label permutations while recovering the
     # single-LFSR stream; this is still cheap (24 mappings x 2 threshold sets)
     # and avoids mistaking a valid PRBS13 waveform for random data.
-    map_candidates = tuple(itertools.permutations(range(4)))
+    # Level-map scan breadth.  ``all`` is the legacy 24-permutation scan
+    # (Virtuoso analoglib sources may relabel the PAM4 levels arbitrarily);
+    # ``gray`` scans the natural order + its reversal + the two Gray-equivalent
+    # relabelings; ``identity`` scans only the natural order (cheap
+    # auto-detection screen).  Map breadth trades cost for exotic-source
+    # coverage; the canonical fallback + warning path stays honest for any
+    # record the scan cannot recover.
+    if map_mode is None:
+        map_mode = "all"
+    if map_mode == "identity":
+        map_candidates = ((0, 1, 2, 3),)
+    elif map_mode == "gray":
+        # natural order, its mirror, the 802.3 Gray map (00,01,11,10) and the
+        # mirrored Gray map; (1,0,3,2) is kept for backward compatibility.
+        # (The Gray map itself, (0,1,3,2), was missing from this set.)
+        map_candidates = ((0, 1, 2, 3), (3, 2, 1, 0),
+                          (1, 0, 3, 2), (2, 3, 1, 0), (0, 1, 3, 2))
+    else:
+        map_candidates = tuple(itertools.permutations(range(4)))
+    if symbol_maps is not None:
+        map_candidates = tuple(tuple(m) for m in symbol_maps)
+    phase_order_scan = order if phase_cap is None else order[:max(1, int(phase_cap))]
     # Virtuoso analoglib PRBS13 uses the same polynomial family with the
     # opposite register/output bit convention.  It is still a single LFSR;
     # DUAL13_TAPS is only the alternate tap-index convention here, not the
     # two-plane PAM4 construction.
-    tap_candidates = (taps, DUAL13_TAPS) if n == 13 else (taps,)
-    for phase in order:
+    tap_candidates = ((taps, DUAL13_TAPS) if n == 13 and symbol_maps is None
+                      else (taps,))
+    for phase in phase_order_scan:
         for threshold_source, thr in thr_sets:
             dec = patterns.decode_levels(Mj[n_pre, :, phase], thr)
             for symbol_map in map_candidates:
@@ -2109,20 +2612,73 @@ def align_prbsn(Mj, n, spu, nom, n_ui, taps, n_pre=0, n_sym=None):
         if best is not None and best[0] >= 0.995:
             break  # near-perfect recurrence: later phases cannot improve it
     if best is None:
-        # No clean LFSR run at any phase: the record almost certainly does
+        # No clean LFSR run at any raw phase.  Before the canonical fallback,
+        # run the equalised-retry tier: MMSE-equalise toward the waveform's
+        # own clustered levels, re-decode, and recover the state with the
+        # noise-tolerant scan.  This recovers strongly-ISI / noisy records
+        # whose raw eye cannot decode anywhere; every downstream credibility
+        # gate still applies to the result.  ``enhanced=False`` (pattern
+        # auto-detection) skips this expensive tier.
+        enh = None
+        if enhanced:
+            enh = _enhanced_prbsn_recovery(
+                Mj, n, spu, taps, n_pre, n_sym,
+                scan_all_maps=ENH_SYMBOL_MAPS_ALL,
+                phase_limit=enh_phase_limit,
+                maps=(None if symbol_maps is None
+                      else tuple(tuple(m) for m in symbol_maps)))
+        if enh is not None:
+            enh_seed = int(enh["seed"])
+            enh_ref_bits = _prbsn_ref_bits(enh_seed, n, taps, n_sym)
+            enh_tru_logical = patterns.pack_bits(
+                enh_ref_bits[PRBSN_REF_BITS_MARGIN:
+                             PRBSN_REF_BITS_MARGIN + 2 * n_sym])
+            enh_acc = float((enh["dec"] == enh_tru_logical).mean())
+            seed_diag.emit(
+                "prbsn_selected", result="recovered", prbs_order=int(n),
+                cdr_phase=int(cdr0), phase=int(enh["phase"]),
+                recovery_tier="equalized-retry", basis=str(enh["basis"]),
+                seed=enh_seed, decoded_match=float(enh["match"]),
+                equalized_acc=enh_acc)
+            if enh_acc >= ENH_ACC_OK and enh["match"] >= ENH_MATCH_OK:
+                extra = {"record_kind": "linear",
+                         "margin": PRBSN_REF_BITS_MARGIN,
+                         "recurrence_consistency": float(enh["match"]),
+                         "sampling_phase": int(enh["phase"]),
+                         "threshold_source": "equalized_retry",
+                         "thresholds": [],
+                         "symbol_map": [int(x) for x in enh["symbol_map"]],
+                         "recovered_taps": [int(x) for x in taps],
+                         "acc_basis": "equalized",
+                         "equalized_symbol_acc": float(enh_acc)}
+                enh_tru = _map_logical_to_physical(enh_tru_logical,
+                                                   enh["symbol_map"])
+                return enh_tru, 0, enh_acc, enh_seed, 0, enh_ref_bits, \
+                    True, extra
+        # the record almost certainly does
         # not match the requested polynomial (or the raw eye is completely
         # closed).  Fall back to the canonical release reference - the same
         # alignment the release path used, so the 33-case regression cannot
-        # drift.
+        # drift.  ``light_fallback`` (auto-detection) skips the expensive
+        # canonical alignment: detection only needs the seed_ok verdict.
+        if light_fallback:
+            seed_diag.emit("prbsn_selected", result="fallback",
+                           failure_reason="no_candidate_recovered",
+                           prbs_order=int(n), cdr_phase=int(cdr0))
+            return (None, 0, 0.0, 1, 0, None, False, dict(
+                record_kind="canonical_fallback",
+                recovery_failure="no candidate recovered (light scan)",
+                light=True))
         fallback = _align_prbsn_fallback(
-            Mj, n, spu, nom, n_ui, taps, n_pre=n_pre, n_sym=n_sym)
+            Mj, n, spu, nom, n_ui, taps, n_pre=n_pre, n_sym=n_sym, **fb_kw)
         seed_diag.emit("prbsn_selected", result="fallback",
                        failure_reason="no_candidate_recovered",
                        prbs_order=int(n), cdr_phase=int(cdr0))
         return fallback + (dict(
             record_kind="canonical_fallback",
             recovery_failure="no phase/threshold candidate met the LFSR "
-                             "clean-run and 95% recurrence gate",
+                             "clean-run and 95% recurrence gate "
+                             "(equalised retry also failed)",
             phases_scanned=int(len(order)),
             threshold_sources=[x[0] for x in thr_sets],
             percentile_thresholds=[float(x) for x in thr_sets[-1][1]],
@@ -2139,7 +2695,7 @@ def align_prbsn(Mj, n, spu, nom, n_ui, taps, n_pre=0, n_sym=None):
     bits0 = patterns.unpack_symbols(logical_dec0)
 
     # ----------------------------------------- folded / linear discrimination
-    fold_period = _fold_period(n)
+    fold_period = _fold_period(n, release_fold)
     folded = False
     fold_seed = None
     fold_off = 0
@@ -2218,7 +2774,8 @@ def align_prbsn(Mj, n, spu, nom, n_ui, taps, n_pre=0, n_sym=None):
             # exactly, so an SER=0 acceptance would be a false lock.  Fall
             # back to the canonical release reference.
             return _align_prbsn_fallback(Mj, n, spu, nom, n_ui, taps,
-                                        n_pre=n_pre, n_sym=n_sym) + (None,)
+                                        n_pre=n_pre, n_sym=n_sym,
+                                        **fb_kw) + (None,)
         tru = _map_logical_to_physical(tru, symbol_map)
         return tru, 0, acc, int(seed), int(s0), ref_bits, True, extra
 
@@ -2245,7 +2802,8 @@ def align_prbsn(Mj, n, spu, nom, n_ui, taps, n_pre=0, n_sym=None):
         # recovery is a false lock or a pattern mismatch.  Fall back to the
         # canonical release reference.
         return _align_prbsn_fallback(Mj, n, spu, nom, n_ui, taps,
-                                    n_pre=n_pre, n_sym=n_sym) + (None,)
+                                    n_pre=n_pre, n_sym=n_sym,
+                                    **fb_kw) + (None,)
     # ---- residual symbol-offset refinement (re-anchor to the record start)
     # A maximal-length LFSR stream satisfies the recurrence at every shift,
     # so on an ISI-noisy raw eye the recovered state can sit a few symbols
@@ -2389,7 +2947,8 @@ def _quick_eq_ser(Mj, tru, nom, cdr0, spu):
             best = ser
     return best
 def _generic_prbsn_seed_ctx(Mj, n_prbs, spu, nom, n_ui, taps, n_sym,
-                            n_pre=0, n_post=4):
+                            n_pre=0, n_post=4, symbol_maps=None,
+                            release_fold=True, pattern_name=None):
     """Align a generic single-LFSR PRBSn record and build the seed context.
 
     Runs :func:`align_prbsn` (automatic LFSR state / fold-period / offset
@@ -2407,7 +2966,8 @@ def _generic_prbsn_seed_ctx(Mj, n_prbs, spu, nom, n_ui, taps, n_sym,
     ``prbs_plane_offset``, ``gray_mapping``.
     """
     tru, off, acc, seed, s0, ref_bits, seed_ok, extra = align_prbsn(
-        Mj, n_prbs, spu, nom, n_ui, taps, n_pre=n_pre, n_sym=n_sym)
+        Mj, n_prbs, spu, nom, n_ui, taps, n_pre=n_pre, n_sym=n_sym,
+        symbol_maps=symbol_maps, release_fold=release_fold)
     seed_ref = None
     seed_a = seed_b = None
     bit_off_a = bit_off_b = None
@@ -2453,16 +3013,23 @@ def _generic_prbsn_seed_ctx(Mj, n_prbs, spu, nom, n_ui, taps, n_sym,
         bit_off_a=bit_off_a, bit_off_b=bit_off_b, dual_used=dual_used,
         record_kind=record_kind, seed_source=seed_source,
         seed_diagnostics=dict(extra or {}),
-        test_pattern="prbs%d" % n_prbs, prbs_register=n_prbs,
-        prbs_polynomial=patterns.prbs_polynomial_str(n_prbs, taps),
+        test_pattern=pattern_name or ("prbs%d" % n_prbs),
+        prbs_register=n_prbs,
+        # the polynomial of the taps that actually locked (the alternate
+        # PRBS13 tap convention reports its own polynomial)
+        prbs_polynomial=patterns.prbs_polynomial_str(n_prbs, recovered_taps),
         prbs_taps=list(recovered_taps), prbs_plane_offset=None,
-        gray_mapping=("physical->logical %s" %
+        gray_mapping=_forced_map_label(symbol_maps, (extra or {}).get(
+            "symbol_map"))
+        if symbol_maps is not None
+        else ("physical->logical %s" %
                       (tuple((extra or {}).get("symbol_map", [0, 1, 2, 3])),))
         if extra and (extra or {}).get("symbol_map") != [0, 1, 2, 3]
         else "standard")
 
 
-def _align_prbsn_fallback(Mj, n, spu, nom, n_ui, taps, n_pre=0, n_sym=None):
+def _align_prbsn_fallback(Mj, n, spu, nom, n_ui, taps, n_pre=0, n_sym=None,
+                          symbol_maps=None, release_fold=True):
     """Best-effort canonical-seed alignment used when seed recovery fails.
 
     For short periodic orders (n <= 16) the legacy cyclic FFT / MMSE-residual
@@ -2473,7 +3040,43 @@ def _align_prbsn_fallback(Mj, n, spu, nom, n_ui, taps, n_pre=0, n_sym=None):
     """
     if n_sym is None:
         n_sym = n_ui - 4
-    if n in (11, 31):
+    gray = symbol_maps is not None and \
+        tuple(symbol_maps[0]) == tuple(patterns.GRAY_PHYS_TO_LOGICAL)
+    std_taps = patterns.PRBSQ_TAPS.get(n) if gray else patterns.prbsn_taps(n)
+    if symbol_maps is not None and \
+            tuple(sorted(taps)) != tuple(sorted(std_taps or ())):
+        # user-defined polynomial: canonical-seed reference of exactly the
+        # requested LFSR and level map
+        cname = patterns.custom_prbs_name(n, taps, gray)
+        if n <= 16:
+            tru, off, acc = align_elec_112(Mj, cname, n_sym, (1 << n) - 1,
+                                           nom, n_pre=n_pre)
+            return tru, off, acc, 1, 0, None, False
+        ref = patterns.pattern_symbols(cname, n_ui + LONG_SEARCH_MARGIN)
+        tru, off = align_long_prbs31(Mj, n_sym, spu, nom, n_ui, ref=ref,
+                                     nreg=n, taps=taps, n_pre=n_pre)
+        acc = 0.0
+        for cc in _long_refine_phases(spu):
+            M = np.tensordot(Mj, eq.mmse_taps(Mj, cc, tru, nom), axes=(0, 0))
+            acc = max(acc, 1.0 - eq.count_errors(M, tru, cc) / n_sym)
+        return tru, off, acc, 1, 0, None, False
+    if gray:
+        # 802.3 Gray PRBSnQ: canonical-seed Gray-coded reference
+        qname = "prbs%dq" % n
+        if n <= 16:
+            period = patterns.pattern_period(qname)
+            tru, off, acc = align_elec_112(Mj, qname, n_sym, period, nom,
+                                           n_pre=n_pre)
+            return tru, off, acc, 1, 0, None, False
+        ref = patterns.pattern_symbols(qname, n_ui + LONG_SEARCH_MARGIN)
+        tru, off = align_long_prbs31(Mj, n_sym, spu, nom, n_ui, ref=ref,
+                                     nreg=n, taps=taps, n_pre=n_pre)
+        acc = 0.0
+        for cc in _long_refine_phases(spu):
+            M = np.tensordot(Mj, eq.mmse_taps(Mj, cc, tru, nom), axes=(0, 0))
+            acc = max(acc, 1.0 - eq.count_errors(M, tru, cc) / n_sym)
+        return tru, off, acc, 1, 0, None, False
+    if n == 11 or (n == 31 and release_fold):
         # Release names: the canonical 2047-symbol reference reproduces the
         # folded release records (prbs11/prbs31), matching the V1.3.0 release
         # alignment exactly.  e112 records (and prbs11, whose LFSR period is
@@ -2729,6 +3332,75 @@ def _prbs13_scan(Mj, n_sym, spu, nom, stop_score=0.995, n_pre=0):
     return best
 
 
+def _prbs13_dual_scan_equalized(Mj, n_sym, spu, nom, n_pre=0):
+    """Equalised-retry dual-plane PRBS13 seed recovery.
+
+    Same contract as :func:`_prbs13_scan`: per sampling phase the record is
+    MMSE-equalised toward its own clustered levels (no a-priori seed), the
+    equalised eye is decoded, the MSB plane is recovered with the exact
+    gate and then the noise-tolerant scan, and the B plane is recovered
+    from ``lsb xor A`` the same way.  Candidates are scored exactly like
+    :func:`_prbs13_scan` (minimum bit-plane accuracy of the regenerated
+    reference, maximised over the phases within ``DUAL13_EYE_W`` of the
+    crossing CDR).  Returns the :func:`_prbs13_scan` tuple shape or None.
+    """
+    flat = Mj[n_pre].ravel()
+    cdr0 = eq.cdr_from_crossing(flat, spu)
+    order = sorted(range(spu), key=lambda p: min((p - cdr0) % spu,
+                                                 (cdr0 - p) % spu))
+    best = None
+    best_key = None
+    for phase in order[:min(int(spu), ENH_PHASE_LIMIT)]:
+        dec, _lv = _equalized_decode_at(Mj, n_pre, phase)
+        if dec is None or len(dec) < 64:
+            continue
+        msb = (dec >> 1) & 1
+        lsb = dec & 1
+        ra = patterns.recover_seed(msb, 13, DUAL13_TAPS)
+        if ra is None:
+            ra = patterns.recover_seed_noisy(msb, 13, DUAL13_TAPS,
+                                             match_min=ENH_CONS_MIN)
+        if ra is None:
+            continue
+        sa, _s0a, ca = ra
+        Aref = patterns.lfsr_bits(sa, 13, len(dec) + 64, DUAL13_TAPS)
+        b_input = lsb ^ Aref[:len(dec)]
+        rb = patterns.recover_seed(b_input, 13, DUAL13_TAPS)
+        if rb is None:
+            rb = patterns.recover_seed_noisy(b_input, 13, DUAL13_TAPS,
+                                             match_min=ENH_CONS_MIN)
+        if rb is None:
+            continue
+        sb, _s0b, cb = rb
+        Bref = patterns.lfsr_bits(sb, 13, len(dec) + 64, DUAL13_TAPS)
+        ref = 2 * Aref[:len(dec)] + (Aref[:len(dec)] ^ Bref[:len(dec)])
+        ref_msb = (ref >> 1) & 1
+        ref_lsb = ref & 1
+        best_plane_acc = 0.0
+        best_dec = None
+        for ph in ((cdr0 + dp) % spu
+                   for dp in range(-DUAL13_EYE_W, DUAL13_EYE_W + 1)):
+            _dec_eq, _lv2 = _equalized_decode_at(Mj, n_pre, ph)
+            if _dec_eq is None:
+                continue
+            msb_acc = float((((_dec_eq >> 1) & 1) == ref_msb).mean())
+            lsb_acc = float(((_dec_eq & 1) == ref_lsb).mean())
+            plane_acc = min(msb_acc, lsb_acc)
+            if plane_acc > best_plane_acc:
+                best_plane_acc = plane_acc
+                best_dec = _dec_eq
+        if best_dec is None:
+            continue
+        score = best_plane_acc
+        key = (score, min(ca, cb))
+        if best_key is None or key > best_key:
+            best = (score, phase, None, sa, sb, 0, 0, ca, cb, best_dec)
+            best_key = key
+        if score >= 0.995:
+            break
+    return best
+
+
 def _prbs13_dual_score(v, spu, n_ui, nom):
     """Seed-independent score of a resampled PRBS13 record.
 
@@ -2877,6 +3549,16 @@ def align_prbs13_dual(Mj, n_sym, spu, nom, taps=DUAL13_TAPS,
         seed_margin : backward margin used for ``refA_bits``/``refB_bits``.
     """
     best = _prbs13_scan(Mj, n_sym, spu, nom, n_pre=n_pre)
+    if (best is None or best[0] < PRBS13_ACC_OK) and n_sym >= 2 * EQV_MIN_SYM:
+        # Raw-eye scan failed or scored below the credibility gate: retry on
+        # the MMSE-equalised eye (still seed-independent).  Heavy-ISI records
+        # whose raw eye cannot decode anywhere recover here.
+        enh = _prbs13_dual_scan_equalized(Mj, n_sym, spu, nom, n_pre=n_pre)
+        if enh is not None and (best is None or enh[0] > best[0]):
+            best = enh
+            seed_diag.emit("prbs13_selected", result="recovered",
+                           recovery_tier="equalized-retry",
+                           score=float(best[0]))
     if best is None or best[0] < PRBS13_ACC_OK:
         A, B = patterns._prbs13_planes(n_sym)
         ref = 2 * A + (A ^ B)
@@ -2977,6 +3659,40 @@ def _optical_frontend(s, spu, rate_gbps):
     return v, N_UI_KEEP, 64, legacy
 
 
+RX_MODELS = ("legacy", "bt4")
+
+
+def _optical_frontend_bt4(t, s, n_ui, spu, ui, samples_per_ui, is_virtuoso,
+                          uniform_grid, ptype, rate_gbps, bw_over_baud):
+    """Standard optical front end: resample + BT4 reference receiver.
+
+    The measured optical waveform is placed on a uniform analysis grid
+    (records already sampled at ``spu`` are sliced; Virtuoso adaptive grids
+    use the phase-scan resampler; other non-uniform grids are linearly
+    resampled, default 64 samples/UI) and passed through the 4th-order
+    Bessel-Thomson reference receiver (:func:`optical.reference_receiver_bt4`,
+    3 dB bandwidth ``bw_over_baud`` x baud).  No dispersion delay is applied
+    and no fixed 1927-UI window is cut: the requested ``n_ui`` window is
+    kept.
+
+    Returns
+    -------
+    (v, spu)
+    """
+    auto = str(samples_per_ui).strip().lower() in ("auto", "", "none")
+    if uniform_grid and len(s) >= n_ui * spu and (
+            not is_virtuoso or _raw_grid_matches_spu(t, spu, ui)):
+        v = np.asarray(s[: n_ui * spu], dtype=float)
+    elif is_virtuoso:
+        spu = 64 if auto else int(spu)
+        v, _ph = _resample_virtuoso(t, s, n_ui, spu, ui, ptype, NOM_SRC,
+                                    rate_gbps)
+    else:
+        spu = 64 if auto else int(spu)
+        v = csv_io.resample_uniform(t, s, n_ui, spu, ui, phase=0.0)
+    return reference_receiver_bt4(v, spu, bw_over_baud), spu
+
+
 def _vlog(verbose, msg):
     """Print a progress line when the CLI verbose flag is enabled."""
     if verbose:
@@ -2994,7 +3710,8 @@ def _diag_normalization(info):
 
 def _run_core(path, pattern="auto", rate_gbps=112, domain="electrical",
               samples_per_ui=64, window="auto", ffe_pre_cursor=0,
-              ffe_post_cursor=4, verbose=False):
+              ffe_post_cursor=4, verbose=False, release_fold=True,
+              rx_model="legacy", rx_bw_over_baud=REF_RX_BW_OVER_BAUD):
     """Shared deterministic front-end of the pipeline.
 
     Parses the waveform CSV (auto format/units), resolves the pattern family,
@@ -3034,7 +3751,11 @@ def _run_core(path, pattern="auto", rate_gbps=112, domain="electrical",
     prbs_plane_offset, gray_mapping.
     """
     validate_pattern_request(pattern)
+    if rx_model not in RX_MODELS:
+        raise ValueError("unknown rx_model %r" % (rx_model,))
     t, s, meta = csv_io.read_waveform(path, domain)
+    for msg in meta.get("unit_warnings") or ():
+        warnings.warn(msg, RuntimeWarning)
     is_virtuoso = meta["is_virtuoso"]
     # Virtuoso's ``Bitrate=...`` header token is often a user-defined
     # variable, not a guaranteed description of the exported waveform.  Keep
@@ -3085,8 +3806,18 @@ def _run_core(path, pattern="auto", rate_gbps=112, domain="electrical",
         gen = parse_prbsn(ptype)
     if gen is not None:
         n_prbs, taps = gen
+        popts = _prbsn_opts(pattern if parse_prbsn(pattern) is not None
+                            else ptype, release_fold)
         if domain == "optical":
-            if is_virtuoso and n_prbs == 13:
+            if rx_model == "bt4":
+                n_ui = csv_io.auto_window_prbsn(n_prbs, n_ui_avail, spu) \
+                    if window == "auto" else int(window)
+                v, spu = _optical_frontend_bt4(
+                    t, s, n_ui, spu, ui, samples_per_ui, is_virtuoso,
+                    uniform_grid, popts["pattern_name"] or "prbs%d" % n_prbs,
+                    rate_gbps, rx_bw_over_baud)
+                optical_legacy = False
+            elif is_virtuoso and n_prbs == 13:
                 # Explicit single-LFSR PRBS13 source records are used for
                 # seed validation.  Recover on the measured optical source
                 # waveform before the release optical receiver crop; the
@@ -3096,7 +3827,8 @@ def _run_core(path, pattern="auto", rate_gbps=112, domain="electrical",
                     if window == "auto" else int(window)
                 spu = 64
                 v, _ph = _resample_virtuoso(
-                    t, s, n_ui, spu, ui, "prbs%d" % n_prbs,
+                    t, s, n_ui, spu, ui,
+                    popts["pattern_name"] or "prbs%d" % n_prbs,
                     NOM_SRC, rate_gbps)
                 optical_legacy = False
             else:
@@ -3121,7 +3853,8 @@ def _run_core(path, pattern="auto", rate_gbps=112, domain="electrical",
                     if str(samples_per_ui).strip().lower() in ("auto", "", "none"):
                         spu = RESAMPLE_DEFAULT_SPU
                     v, _ph = _resample_virtuoso(
-                        t, s, n_ui, spu, ui, "prbs%d" % n_prbs,
+                        t, s, n_ui, spu, ui,
+                        popts["pattern_name"] or "prbs%d" % n_prbs,
                         NOM_128_P13 if n_prbs == 13 else NOM_ELEC, rate_gbps)
             elif not uniform_grid:
                 # non-uniform ``time,out`` grids: linearly resample onto a
@@ -3155,7 +3888,11 @@ def _run_core(path, pattern="auto", rate_gbps=112, domain="electrical",
         # adapt the resampled waveform before any decode, seed recovery or
         # equalisation runs so inverted / DC-shifted exports reach the same
         # seed, offset and metrics as the correct-polarity DC-free record.
-        v, _norm_info = _normalize_input_prbsn(v, spu, n_prbs, taps, nom)
+        v, _norm_info = _normalize_input_prbsn(
+            v, spu, n_prbs, taps, nom,
+            symbol_map=(popts["symbol_maps"][0] if popts["symbol_maps"]
+                        else None),
+            allow_flip=popts["symbol_maps"] is None)
         if _norm_info:
             _vlog(verbose, "输入归一化: %s" % _norm_info)
             _diag_normalization(_norm_info)
@@ -3175,7 +3912,9 @@ def _run_core(path, pattern="auto", rate_gbps=112, domain="electrical",
                        (meas_oma, ref_oma))
                 nom = measured_nom
         Mj = eq.build_Mj(v, spu, n_sym, ffe_pre_cursor, ffe_post_cursor)
-        if domain == "optical" and optical_legacy and n_prbs != 13:
+        if domain == "optical" and optical_legacy and n_prbs != 13 \
+                and popts["symbol_maps"] is None \
+                and (popts["release_fold"] or n_prbs != 31):
             # Release-compatible optical front-end: the optical reference
             # receiver aligns against the canonical pattern period with the
             # 5-round optical phase scan (auto seed recovery would change the
@@ -3208,22 +3947,30 @@ def _run_core(path, pattern="auto", rate_gbps=112, domain="electrical",
                 gray_mapping="standard",
                 ffe_pre_cursor=ffe_pre_cursor, ffe_post_cursor=ffe_post_cursor)
         sc = _generic_prbsn_seed_ctx(Mj, n_prbs, spu, nom, n_ui, taps, n_sym,
-                                     n_pre=ffe_pre_cursor, n_post=ffe_post_cursor)
+                                     n_pre=ffe_pre_cursor, n_post=ffe_post_cursor,
+                                     **popts)
         _vlog(verbose, "seed恢复: seed=%s acc=%.4f kind=%s seed_ok=%s source=%s" %
                        (sc["seed"], sc["acc"], sc["record_kind"],
                         sc["seed_ok"], sc["seed_source"]))
         cdr0 = cdr0_of(v, spu)
         long_ref = None
-        if domain_grp == "long" and sc["seed_ref"] is None:
+        unfolded31 = n_prbs == 31 and not popts["release_fold"]
+        if (domain_grp == "long" or unfolded31) and sc["seed_ref"] is None:
             # Canonical-seed fallback on a long linear record: the candidate
             # pool must shift within the linear stream (like the release long
             # path), not the folded 2047-period reference - otherwise the
             # pool reference and the aligned truth disagree and SER collapses.
-            long_ref = patterns.lfsr_linear_symbols(
-                n_prbs, n_ui + LONG_SEARCH_MARGIN, spu, taps)
+            # A true (unfolded) PRBS31/PRBS31Q record is always linear.
+            if popts["symbol_maps"] is not None:
+                long_ref = patterns.pattern_symbols(
+                    popts["pattern_name"], n_ui + LONG_SEARCH_MARGIN)
+            else:
+                long_ref = patterns.lfsr_linear_symbols(
+                    n_prbs, n_ui + LONG_SEARCH_MARGIN, spu, taps)
         return dict(
             t=t, s=s, meta=meta, is_virtuoso=is_virtuoso, spu=spu, ui=ui,
-            ptype="prbs%d" % n_prbs, n_ui_avail=n_ui_avail, n_ui=n_ui, v=v,
+            ptype=popts["pattern_name"] or ("prbs%d" % n_prbs),
+            n_ui_avail=n_ui_avail, n_ui=n_ui, v=v,
             domain_grp=domain_grp, n_sym=n_sym, Mj=Mj, nom=nom,
             tru=sc["tru"], off=sc["off"], acc=sc["acc"], cdr0=cdr0,
             long_ref=long_ref, seed_ref=sc["seed_ref"], gen_prbsn=n_prbs,
@@ -3245,7 +3992,13 @@ def _run_core(path, pattern="auto", rate_gbps=112, domain="electrical",
 
     # --------------------------------------------- resampling
     optical_legacy = False
-    if is_virtuoso:
+    if domain == "optical" and rx_model == "bt4":
+        v, spu = _optical_frontend_bt4(t, s, n_ui, spu, ui, samples_per_ui,
+                                       is_virtuoso, uniform_grid, ptype,
+                                       rate_gbps, rx_bw_over_baud)
+        domain_grp = ("v128" if is_virtuoso
+                      else "e112" if n_ui <= 4096 else "long")
+    elif is_virtuoso:
         if uniform_grid and _raw_grid_matches_spu(t, spu, ui):
             # Virtuoso-table-header records already sampled at the requested
             # spu are handled exactly like ``time,out`` uniform records:
@@ -3293,7 +4046,8 @@ def _run_core(path, pattern="auto", rate_gbps=112, domain="electrical",
     record_kind = None
     seed_diagnostics = None
     auto_gen_prbsn = None
-    if domain == "optical" and (optical_legacy or is_virtuoso):
+    if domain == "optical" and (optical_legacy or is_virtuoso
+                                or rx_model == "bt4"):
         nom = NOM_SRC
         if ptype == "ssprq":
             # SSPRQ alignment uses measured optical class levels and permits
@@ -3405,7 +4159,8 @@ def _run_core(path, pattern="auto", rate_gbps=112, domain="electrical",
             Mj = eq.build_Mj(v, spu, n_sym, ffe_pre_cursor, ffe_post_cursor)
             sc = _generic_prbsn_seed_ctx(Mj, n_prbs, spu, nom, n_ui, taps,
                                          n_sym, n_pre=ffe_pre_cursor,
-                                         n_post=ffe_post_cursor)
+                                         n_post=ffe_post_cursor,
+                                         **_prbsn_opts(ptype, release_fold))
             tru, off, acc = sc["tru"], sc["off"], sc["acc"]
             seed_ref = sc["seed_ref"]
             seed_a, seed_b = sc["seed_a"], sc["seed_b"]
@@ -3428,7 +4183,7 @@ def _run_core(path, pattern="auto", rate_gbps=112, domain="electrical",
             # 4096 UI is still a folded-period record).
             v, _norm = _normalize_input_ssprq(v, spu, n_sym, nom)
             if _norm:
-                _vlog(verbose, "输入归一化: %s" % _norm)
+                _vlog(verbose, "i: %s" % _norm)
                 _diag_normalization(_norm)
             Mj = eq.build_Mj(v, spu, n_sym, ffe_pre_cursor, ffe_post_cursor)
             period = patterns.pattern_period(ptype)
@@ -3461,7 +4216,8 @@ def _run_core(path, pattern="auto", rate_gbps=112, domain="electrical",
             Mj = eq.build_Mj(v, spu, n_sym, ffe_pre_cursor, ffe_post_cursor)
             sc = _generic_prbsn_seed_ctx(Mj, n_prbs, spu, nom, n_ui, taps,
                                          n_sym, n_pre=ffe_pre_cursor,
-                                         n_post=ffe_post_cursor)
+                                         n_post=ffe_post_cursor,
+                                         **_prbsn_opts(ptype, release_fold))
             tru, off, acc = sc["tru"], sc["off"], sc["acc"]
             seed_ref = sc["seed_ref"]
             seed_a, seed_b = sc["seed_a"], sc["seed_b"]
@@ -3518,9 +4274,14 @@ def _run_core(path, pattern="auto", rate_gbps=112, domain="electrical",
 def analyze(path, pattern="auto", rate_gbps=112, domain="electrical",
             samples_per_ui="auto", window="auto", case_id=None, verbose=False,
             ffe_pre_cursor=0, ffe_post_cursor=4,
-            equalized_validation=True, ffe_bounds_enabled=False,
+            equalized_validation=True, ffe_bounds_enabled=None,
+            dfe_b1_unbounded=False,
             threshold_mode="linear", seed_diagnostics=None,
-            seed_diagnostics_file=None, prbs_order=None):
+            seed_diagnostics_file=None, prbs_order=None,
+            standard=standards.DEFAULT_STANDARD,
+            ffe_geometry_explicit=None, ffe_auto_geometry=False,
+            tdecq_mode="standard", sigma_s=0.0, sigma_combine="min",
+            ceq_model=None, rx_bw_over_baud=REF_RX_BW_OVER_BAUD):
     """Run the automatic pipeline on one waveform and return the output JSON.
 
     Parameters
@@ -3548,6 +4309,19 @@ def analyze(path, pattern="auto", rate_gbps=112, domain="electrical",
         FFE pre-cursor tap count (taps before the main tap), 0..5.
     ffe_post_cursor : int
         FFE post-cursor tap count (taps after the main tap), 0..30.
+    equalized_validation : bool
+        enable the validated-equalised branch on closed-eye canonical
+        fallbacks.
+    ffe_bounds_enabled : bool or None
+        opt-in IEEE P802.3dj DRAFT bounded multi-tap FFE candidate pool.
+        ``None`` (default) derives it from the standard profile: disabled
+        for ``ieee8023-2022``, enabled for ``ieee8023dj-draft``.  Passing
+        True under the 2022 profile raises ValueError - the draft machinery
+        and the published standard can never mix in one measurement.
+    dfe_b1_unbounded : bool
+        Add an explicitly penalised diagnostic candidate with ``0 <= b1 < 1``.
+        The default remains the normative open upper bound ``b1 < 0.3``.
+        Requires a draft profile.
     seed_diagnostics : bool or None
         Enable the opt-in ASCII seed-recovery diagnostic stream.  ``None``
         leaves enablement to ``TDECQ_SEED_DIAGNOSTICS``.
@@ -3558,12 +4332,97 @@ def analyze(path, pattern="auto", rate_gbps=112, domain="electrical",
         Removed API compatibility argument.  Supplying it raises
         ``ValueError``; select the order in ``pattern`` (for example,
         ``pattern='prbs13'``) instead.
+    standard : str
+        ``'ieee8023-2022'`` (published standard; default) or
+        ``'ieee8023dj-draft'`` (200G/lane draft reference equalizer).  The
+        profile decides whether the bounded FFE/DFE machinery may run and
+        which JSON fields are emitted; the reported metric semantics of the
+        shared 5-tap path are identical in both profiles.
+    ffe_geometry_explicit : bool or None
+        True when the caller explicitly requested the FFE geometry (CLI
+        ``--ffe-pre-cursor/--ffe-post-cursor/--ffe-taps``).  ``None``
+        infers it from the geometry differing from the profile default.
+    ffe_auto_geometry : bool
+        Opt-in return to the legacy auto-selection behaviour: when True and
+        the bounded pool is active, the pool may pick a different tap
+        count / main-tap position than requested (``ffe_geometry_override``).
+        Default False: an explicitly requested geometry is LOCKED - the
+        bounded pool evaluates only the requested (N, main-tap) geometry
+        and can never silently replace it.
+
+    tdecq_mode : str
+        ``'standard'`` (default): the reference FFE (+ draft DFE) is the one
+        that directly minimises TDECQ under the reference-receiver
+        constraints (:mod:`tdecq_tool.tdecq_std`); IEEE tap naming
+        (pre-cursor taps read later samples).  ``'legacy'``: the historical
+        release-compatible candidate selection (reproduces the 33-case
+        release manifest; NOT a minimisation, and its pre/post naming is
+        inverted relative to IEEE).
+    sigma_s : float
+        standard mode: instrument noise RMS referred to the FFE input
+        (waveform units) removed from the measurement (default 0).
+    sigma_combine : str
+        standard mode: ``'min'`` / ``'max'`` combination of the left/right
+        window sigmas.
+    ceq_model : str or None
+        standard mode: ``'white'`` / ``'bt4'`` noise-enhancement model
+        (default: white for 802.3-2022, bt4 for the dj draft).
+    rx_bw_over_baud : float
+        standard mode, optical domain: 3 dB bandwidth of the 4th-order
+        Bessel-Thomson reference receiver in units of the symbol rate
+        (default 0.5).  The legacy mode keeps its historical optical front
+        end (dispersion delay + first-order low-pass).
 
     Returns
     -------
     dict with the SPEC section-5 output JSON.
     """
     validate_pattern_request(pattern, prbs_order)
+    profile = standards.get_profile(standard)
+    tdecq_mode = str(tdecq_mode or "standard").strip().lower()
+    if tdecq_mode not in TDECQ_MODES:
+        raise ValueError("unknown tdecq_mode %r; expected one of %s"
+                         % (tdecq_mode, ", ".join(TDECQ_MODES)))
+    if tdecq_mode == "standard":
+        return _analyze_standard(
+            path, pattern=pattern, rate_gbps=rate_gbps, domain=domain,
+            samples_per_ui=samples_per_ui, window=window, case_id=case_id,
+            verbose=verbose, ffe_pre_cursor=ffe_pre_cursor,
+            ffe_post_cursor=ffe_post_cursor,
+            ffe_bounds_enabled=ffe_bounds_enabled,
+            dfe_b1_unbounded=dfe_b1_unbounded,
+            threshold_mode=threshold_mode, seed_diagnostics=seed_diagnostics,
+            seed_diagnostics_file=seed_diagnostics_file, profile=profile,
+            ffe_geometry_explicit=ffe_geometry_explicit,
+            ffe_auto_geometry=ffe_auto_geometry, sigma_s=sigma_s,
+            sigma_combine=sigma_combine, ceq_model=ceq_model,
+            rx_bw_over_baud=rx_bw_over_baud)
+    if ffe_bounds_enabled is None:
+        ffe_bounds_enabled = profile.allow_ffe_bounds
+    if ffe_bounds_enabled:
+        profile.check_ffe_bounds_allowed()
+    if dfe_b1_unbounded:
+        profile.check_dfe_allowed()
+    # ---- explicit-geometry lock (issue: requested tap count must win) ------
+    # A geometry the caller spelled out on the CLI is binding: the bounded
+    # pool evaluates exactly that (N, main-tap) pair.  The legacy
+    # auto-selection (pool picks N in {5,7,9} + pulse-peak main tap, which
+    # can override the request) now requires the explicit --ffe-auto-geometry
+    # opt-in.  ``ffe_geometry_explicit=None`` infers the intent from the
+    # geometry differing from the API defaults; a draft-profile caller that
+    # left the geometry at the API default takes the profile default
+    # geometry (3 pre / 11 post = the 15-tap dj reference equalizer).
+    if ffe_geometry_explicit is None:
+        ffe_geometry_explicit = bool(
+            int(ffe_pre_cursor) != 0 or int(ffe_post_cursor) != 4)
+        if not ffe_geometry_explicit and profile.draft:
+            ffe_pre_cursor = profile.default_pre
+            ffe_post_cursor = profile.default_post
+    # Draft profile: the P802.3dj reference equalizer is a FIXED receiver
+    # definition (15-tap FFE + 1T DFE within the bound table), so its
+    # geometry is locked unless the legacy auto-selection is requested.
+    lock_geometry = (bool(ffe_geometry_explicit) or bool(profile.draft)) \
+        and not bool(ffe_auto_geometry)
     seed_diag.configure(seed_diagnostics, seed_diagnostics_file)
     threshold_mode = eq.normalise_threshold_mode(threshold_mode)
     seed_diag.emit("run", input=os.path.basename(os.fspath(path)),
@@ -3609,7 +4468,7 @@ def analyze(path, pattern="auto", rate_gbps=112, domain="electrical",
                     (id_ne0 / n_sym) if n_sym else float("nan")))
 
     # --------------------------------------------- candidate pool
-    long_syms = c["long_ref"] if domain_grp == "long" else None
+    long_syms = c["long_ref"]
     cands, tru_by_off, offs = build_pool(Mj, ptype, spu, n_ui, n_sym, off,
                                          cdr0, nom, is_virtuoso, domain,
                                          long_syms=long_syms,
@@ -3672,7 +4531,9 @@ def analyze(path, pattern="auto", rate_gbps=112, domain="electrical",
                                   domain_grp, closed_eye, off0=off,
                                   ptype=ptype, force=(not main_ok),
                                   verbose=verbose,
-                                  threshold_mode=threshold_mode)
+                                  threshold_mode=threshold_mode,
+                                  b1_unbounded_enabled=dfe_b1_unbounded,
+                                  lock_geometry=lock_geometry)
         if brepl is not None:
             chosen = brepl["chosen"]
             ffe_bounds_info = brepl["info"]
@@ -3740,6 +4601,8 @@ def analyze(path, pattern="auto", rate_gbps=112, domain="electrical",
             and eqv_info is None):
         method = "samp"
     w = chosen["w"]
+    b1 = float(chosen.get("b1", 0.0))
+    b1_unbounded_selected = bool(chosen.get("b1_unbounded", False))
     cdr = chosen["cdr"]
     # evaluate against the truth that belongs to the selected offset
     # (the alignment offset and the candidate offset may differ); when the
@@ -3748,6 +4611,15 @@ def analyze(path, pattern="auto", rate_gbps=112, domain="electrical",
     tru = (_bounded_tru if _bounded_tru is not None
            else tru_by_off[chosen["off"]])
     M = np.tensordot(Mj, w, axes=(0, 0))
+    if b1 > 0.0:
+        feedback = chosen.get("dfe_feedback")
+        if feedback is None or len(feedback) != len(tru):
+            oma_input = chosen.get("oma_input")
+            if oma_input is None:
+                in_lv = eq.levels_at(Mj[ffe_pre_cursor], tru, cdr)
+                oma_input = float(in_lv[3] - in_lv[0])
+            feedback = fb.pam4_feedback(tru, oma_input)
+        M = M - b1 * np.asarray(feedback)[:, None]
     metric, det = eq.metric_detail(M, w, tru, cdr, spu, method,
                                    threshold_mode=threshold_mode)
     ne = eq.count_errors(M, tru, cdr)
@@ -3768,6 +4640,8 @@ def analyze(path, pattern="auto", rate_gbps=112, domain="electrical",
               or not np.isfinite(det.get("sigmaG", float("nan"))))
     if bad_pt:
         w = ident
+        b1 = 0.0
+        b1_unbounded_selected = False
         cdr = cdr0
         # the degenerate-point fallback must inherit the *current* geometry:
         # when the bounded branch replaced the tap stack with a shorter
@@ -3855,7 +4729,9 @@ def analyze(path, pattern="auto", rate_gbps=112, domain="electrical",
                 "measured pulse peak / bounded-pool selection, not the "
                 "requested main cursor" % (m_actual, m_declared,
                                            m_actual - m_declared))
-        sat, viol = fb.check_feasible(w_arr, m_declared)
+        sat, viol = fb.check_feasible(
+            w_arr, m_declared, b1=b1,
+            b1_unbounded=b1_unbounded_selected)
         geometry_override = bool(ffe_pre_cursor != req_pre
                                  or ffe_post_cursor != req_post)
         warn_parts = []
@@ -3890,7 +4766,53 @@ def analyze(path, pattern="auto", rate_gbps=112, domain="electrical",
             ffe_geometry_override=geometry_override,
             ffe_geometry_override_reason=geom_msg,
             metric_credible=bool(metric_credible),
-            metric_credible_reason=metric_credible_reason)
+            metric_credible_reason=metric_credible_reason,
+            dfe_b1=float(b1),
+            dfe_enabled=bool(b1 > 0.0),
+            dfe_b1_at_bound=bool(
+                b1 > 0.0 and b1 >= fb.FFE_BOUNDS.b1_max - 1e-6),
+            dfe_b1_unbounded_selected=bool(b1_unbounded_selected),
+            dfe_b1_unbounded_selected_count=int(b1_unbounded_selected))
+        lb_w, ub_w = fb.bounds_for(len(w_arr), m_declared)
+        ffe_over = int(np.sum((w_arr < lb_w - fb.FFE_BOUNDS.box_tol) |
+                              (w_arr > ub_w + fb.FFE_BOUNDS.box_tol)))
+        ffe_bounds_extra["ffe_overlimit_tap_count"] = ffe_over
+        ffe_bounds_extra["ffe_overlimit_tap_total"] = int(len(w_arr))
+        ffe_bounds_extra["ffe_overlimit_max_severity"] = float(max(
+            np.max(np.maximum(lb_w - w_arr, 0.0)),
+            np.max(np.maximum(w_arr - ub_w, 0.0)))) if len(w_arr) else 0.0
+        _side = np.delete(w_arr, m_declared) if len(w_arr) else np.array([])
+        ffe_bounds_extra["ffe_side_tap_l1"] = float(
+            np.sum(np.abs(_side))) if len(_side) else 0.0
+        ffe_bounds_extra["ffe_side_tap_max_abs"] = float(
+            np.max(np.abs(_side))) if len(_side) else 0.0
+        if ffe_bounds_info:
+            ffe_bounds_extra["ffe_unconstrained_overlimit_count"] = int(
+                ffe_bounds_info.get("ffe_unconstrained_overlimit_count", 0))
+            ffe_bounds_extra["ffe_unconstrained_tap_total"] = int(
+                ffe_bounds_info.get("ffe_unconstrained_tap_total", 0))
+            ffe_bounds_extra["ffe_unconstrained_max_severity"] = float(
+                ffe_bounds_info.get("ffe_unconstrained_max_severity", 0.0))
+            ffe_bounds_extra["ffe_eye_lid_thickness"] = float(
+                ffe_bounds_info.get("eye_lid_thickness", float("nan")))
+            ffe_bounds_extra["ffe_eye_lid_main"] = float(
+                ffe_bounds_info.get("eye_lid_main", float("nan")))
+        else:
+            _lid_final = float(eq.eye_lid_thickness(M, tru, cdr, spu))
+            if not np.isfinite(_lid_final):
+                _lid_final = 1e9
+            ffe_bounds_extra["ffe_eye_lid_thickness"] = _lid_final
+            ffe_bounds_extra["ffe_eye_lid_main"] = float(
+                ffe_bounds_extra["ffe_eye_lid_thickness"])
+        ffe_bounds_extra["ffe_eye_lid_improvement"] = float(
+            ffe_bounds_extra["ffe_eye_lid_main"] -
+            ffe_bounds_extra["ffe_eye_lid_thickness"])
+        if len(w_arr) and m_declared > 0 and m_declared + 1 < len(w_arr):
+            ff_diff = abs((w_arr[m_declared + 1] - w_arr[m_declared - 1]) /
+                          w_arr[m_declared]) if abs(w_arr[m_declared]) > 1e-12 else float("inf")
+            ffe_bounds_extra["dfe_diff_ffe_term"] = float(ff_diff)
+            ffe_bounds_extra["dfe_diff_b1_dominant"] = bool(
+                b1 > 0.0 and b1 >= 0.8 * ff_diff)
         for wmsg in warn_parts:
             import warnings
             warnings.warn("[%s] %s" % (case_id or os.path.basename(path),
@@ -3909,7 +4831,10 @@ def analyze(path, pattern="auto", rate_gbps=112, domain="electrical",
     prbs13_canon = (not c.get("seed_ok", True) and
                     is_prbs13_dual(c.get("ptype")))
     if is_gen:
-        taps = patterns.prbsn_taps(n_prbs)
+        _g = parse_prbsn(c.get("ptype"))
+        taps = (_g[1] if _g is not None and _g[0] == n_prbs
+                else patterns.prbsn_taps(n_prbs))
+        _forced = _prbsn_opts(c.get("ptype"))["symbol_maps"]
         n_lv = int(len(np.unique(tru)))
         pattern_levels_used = n_lv
     if prbs13_canon and c.get("dual_used"):
@@ -3945,8 +4870,10 @@ def analyze(path, pattern="auto", rate_gbps=112, domain="electrical",
         lv_w = eq.levels_at(M, tru, cdr)
         thr_w = [(lv_w[0] + lv_w[1]) / 2, (lv_w[1] + lv_w[2]) / 2,
                  (lv_w[2] + lv_w[3]) / 2]
-        bits_w = patterns.unpack_symbols(
-            patterns.decode_levels(M[:, cdr], thr_w))
+        dec_w = patterns.decode_levels(M[:, cdr], thr_w)
+        if _forced is not None:
+            dec_w = _map_symbols(dec_w, _forced[0])
+        bits_w = patterns.unpack_symbols(dec_w)
         cons = patterns.verify_prbs_bits(bits_w, n_prbs, taps)
         if not c.get("seed_ok") and ser > WARN_SER:
             # The LFSR state could not be recovered from the raw eye (heavy
@@ -4096,8 +5023,8 @@ def analyze(path, pattern="auto", rate_gbps=112, domain="electrical",
         det["Ceq"] = float(np.sqrt((w ** 2).sum()))
     if det.get("sigmaG") is None or not np.isfinite(det.get("sigmaG")):
         oma = det["levels"][3] - det["levels"][0]
-        det["sigmaG"] = float(oma / (6.0 * 3.414 * 10.0 ** (metric / 10.0))) \
-            if oma > 1e-12 else float("nan")
+        det["sigmaG"] = eq._sigma_from_metric(
+            float(metric), float(oma), float(det["Ceq"]))
 
     # Eye diagnostics must describe the measured waveform, not the nominal
     # FFE target.  A collapsed/non-monotonic eye cannot define physical PAM4
@@ -4160,6 +5087,7 @@ def analyze(path, pattern="auto", rate_gbps=112, domain="electrical",
         sigmaG=float(det["sigmaG"]), ceq=float(det["Ceq"]),
         oma=float(post_eye["OMA"]), pave=float(post_eye["Pave"]),
         w=w, rx_levels=rx_eye["levels"], rx_eye=rx_eye,
+        dfe_b1=float(b1),
         ffe_tap_sum=float(np.sum(w)),
         ffe_max_abs_tap=(float(np.max(np.abs(w))) if len(w) else 0.0),
         rx_level_source=rx_level_source,
@@ -4198,6 +5126,12 @@ def analyze(path, pattern="auto", rate_gbps=112, domain="electrical",
         ffe_post_cursor=int(ffe_post_cursor),
         ffe_tap_count=int(Mj.shape[0]),
         ffe_optimisation=ffe_desc,
+        standard=profile.name,
+        standard_label=profile.label,
+        standard_citation=profile.citation,
+        standard_is_draft=bool(profile.draft),
+        ffe_geometry_locked=bool(lock_geometry),
+        ffe_geometry_explicit=bool(ffe_geometry_explicit),
         ffe_bounds_enabled=bool(ffe_bounds_enabled),
         ffe_bounds_used=bool(ffe_bounds_info is not None),
         ffe_bounds_tap_count=(int(ffe_bounds_info["N"])
@@ -4240,6 +5174,227 @@ def analyze(path, pattern="auto", rate_gbps=112, domain="electrical",
     return build_json(case_id or "auto", ctx)
 
 
+# ---------------------------------------------------------------------------
+# standard measurement path (direct constrained TDECQ minimisation)
+# ---------------------------------------------------------------------------
+TDECQ_MODES = ("standard", "legacy")
+# Front-end geometry used for pattern locking on the standard path.  The
+# alignment machinery (seed recovery / offset search) is shared with the
+# legacy path and was validated with the 5-tap stack, so the standard path
+# always locks the pattern with it; the standard FFE geometry is applied
+# afterwards by :mod:`tdecq_tool.tdecq_std` with IEEE tap direction.
+STD_LOCK_PRE, STD_LOCK_POST = 0, 4
+
+
+def _analyze_standard(path, pattern, rate_gbps, domain, samples_per_ui,
+                      window, case_id, verbose, ffe_pre_cursor,
+                      ffe_post_cursor, ffe_bounds_enabled, dfe_b1_unbounded,
+                      threshold_mode, seed_diagnostics, seed_diagnostics_file,
+                      profile, ffe_geometry_explicit, ffe_auto_geometry,
+                      sigma_s, sigma_combine, ceq_model,
+                      rx_bw_over_baud=REF_RX_BW_OVER_BAUD):
+    """Standard-mode :func:`analyze` (see :mod:`tdecq_tool.tdecq_std`)."""
+    from . import tdecq_std
+    if dfe_b1_unbounded:
+        profile.check_dfe_allowed()
+        raise ValueError("--dfe-b1-unbounded is a legacy diagnostic "
+                         "candidate; it is not available with "
+                         "tdecq_mode='standard'")
+    if ffe_bounds_enabled:
+        profile.check_ffe_bounds_allowed()
+    if ffe_auto_geometry:
+        raise ValueError("--ffe-auto-geometry only applies to "
+                         "tdecq_mode='legacy'")
+    if ffe_bounds_enabled is None:
+        ffe_bounds_enabled = profile.allow_ffe_bounds
+    if ffe_bounds_enabled:
+        profile.check_ffe_bounds_allowed()
+    if ffe_geometry_explicit is None:
+        ffe_geometry_explicit = bool(int(ffe_pre_cursor) != 0
+                                     or int(ffe_post_cursor) != 4)
+    threshold_mode = eq.normalise_threshold_mode(threshold_mode)
+    seed_diag.configure(seed_diagnostics, seed_diagnostics_file)
+    seed_diag.emit("run", input=os.path.basename(os.fspath(path)),
+                   requested_pattern=pattern, rate_gbps=float(rate_gbps),
+                   domain=domain, samples_per_ui=samples_per_ui,
+                   window=window, threshold_mode=threshold_mode)
+    t_start = time.time()
+    c = _run_core(path, pattern=pattern, rate_gbps=rate_gbps, domain=domain,
+                  samples_per_ui=samples_per_ui, window=window,
+                  ffe_pre_cursor=STD_LOCK_PRE,
+                  ffe_post_cursor=STD_LOCK_POST, verbose=verbose,
+                  release_fold=False, rx_model="bt4",
+                  rx_bw_over_baud=rx_bw_over_baud)
+    spu, n_ui, v, tru = c["spu"], c["n_ui"], c["v"], c["tru"]
+    cfg_kw = dict(bounded=bool(ffe_bounds_enabled),
+                  dfe=bool(ffe_bounds_enabled and profile.allow_dfe),
+                  sigma_s=float(sigma_s), sigma_combine=sigma_combine,
+                  threshold_mode=threshold_mode)
+    if ceq_model is not None:
+        cfg_kw["ceq_model"] = ceq_model
+    if ffe_geometry_explicit:
+        cfg = tdecq_std.config_for_profile(profile, n_pre=ffe_pre_cursor,
+                                           n_post=ffe_post_cursor, **cfg_kw)
+    else:
+        cfg = tdecq_std.config_for_profile(profile, **cfg_kw)
+    try:
+        res = tdecq_std.measure(v, spu, tru, c["cdr0"], cfg)
+    except ValueError as exc:
+        if c.get("seed_ok") is False:
+            raise ValueError(
+                "pattern lock failed: the %s LFSR state was not found in the "
+                "waveform and the canonical reference does not fit it (%s); "
+                "check the test pattern / PRBS polynomial setting"
+                % (c.get("ptype"), exc)) from exc
+        raise
+    _vlog(verbose, "standard: N=%d main=%d lag=%d b1=%.4f metric=%.4f dB "
+                   "ser=%.4g" % (cfg.n_taps, res["main_index"], res["lag"],
+                                 res["b1"], res["metric_db"], res["ser"]))
+
+    # ---- credibility / pattern consistency -----------------------------
+    warn = []
+    seed_ok = c.get("seed_ok")
+    if seed_ok is False:
+        warn.append("PRBS seed recovery failed - the reference used for the "
+                    "OMA run search, the LS start and the SER is a canonical "
+                    "fallback and may not match the waveform")
+    if res["ser"] > WARN_SER:
+        warn.append("equalised SER %.3g > %.2g: the test pattern may not "
+                    "match the waveform" % (res["ser"], WARN_SER))
+    pattern_warning = "; ".join(warn) if warn else None
+    if pattern_warning:
+        warnings.warn("pattern mismatch: %s" % pattern_warning,
+                      RuntimeWarning)
+    credible, cred_reason = True, None
+    if res["ser"] > CREDIBLE_SER_MAX:
+        credible = False
+        cred_reason = ("equalised SER %.3g exceeds %.2g: the eye is not "
+                       "opened by the reference equaliser"
+                       % (res["ser"], CREDIBLE_SER_MAX))
+    elif not res["feasible"]:
+        credible = False
+        cred_reason = "no candidate satisfied the reference-equaliser limits"
+    if not credible:
+        warnings.warn("metric not credible: %s" % cred_reason, RuntimeWarning)
+
+    # ---- eye diagnostics (measured unequalised levels / thresholds) -----
+    def _eye(levels, pave, pth):
+        try:
+            e = dict(eq.pam4_eye(np.asarray(levels, float), threshold_mode))
+        except ValueError:
+            return None
+        e["Pave"], e["Pth"] = float(pave), np.asarray(pth, float)
+        return e
+
+    rx_eye = _eye(res["levels"], res["pave"], res["pth"])
+    rx_src = "run_settled_" + res["level_source"]
+    if rx_eye is None:
+        rx_eye = eq.pam4_eye(np.asarray(c["nom"], float), threshold_mode)
+        rx_src = "nominal_fallback_invalid_eye"
+    post_eye = _eye(res["post_levels"], res["pave"], res["pth"])
+    post_src = "class_mean"
+    if post_eye is None:
+        post_eye = rx_eye
+        post_src = "unequalised_fallback_invalid_eye"
+    w = np.asarray(res["taps"], dtype=float)
+    n_t = len(w)
+    desc = ("standard: reference %d-tap T-spaced FFE%s minimising TDECQ "
+            "(unit gain%s; constrained LS start + pattern search; IEEE tap "
+            "direction)" % (n_t, " + 1-tap DFE" if cfg.dfe else "",
+                            ", draft tap-limit table" if cfg.bounded
+                            else ", largest tap in %s"
+                            % (list(cfg.main_candidates),)))
+    ctx = dict(
+        domain="electrical" if domain == "electrical" else "optical",
+        metric=float(res["metric_db"]), raw_metric=float(res["raw_db"]),
+        pre_metric=float(res["ls_db"]),
+        sigmaG=float(res["sigma_G"]), ceq=float(res["Ceq"]),
+        oma=float(res["oma"]), pave=float(res["pave"]), w=w,
+        rx_levels=np.asarray(res["levels"], float), rx_eye=rx_eye,
+        dfe_b1=float(res["b1"]), ffe_tap_sum=float(w.sum()),
+        ffe_max_abs_tap=float(np.max(np.abs(w))),
+        rx_level_source=rx_src,
+        post_ffe_levels=np.asarray(post_eye["levels"], float),
+        post_eye=post_eye, post_level_source=post_src,
+        cdr=int(round(res["eye_centre"])) % spu,
+        ser_phase=int(round(res["eye_centre"])) % spu,
+        ser=float(res["ser"]), ser_raw=res["ne_raw"] / float(res["n_sym"]),
+        ser_pre=float(res["ls_ser"]), ne=int(res["ne"]),
+        n_sym=int(res["n_sym"]), total_ui=n_ui, spu=spu,
+        rate_gbps=rate_gbps,
+        test_pattern=c["test_pattern"], prbs_register=c["prbs_register"],
+        prbs_polynomial=c["prbs_polynomial"], prbs_taps=c["prbs_taps"],
+        prbs_seed=c["prbs_seed"], prbs_plane_offset=c["prbs_plane_offset"],
+        prbs_seed_a=c.get("seed_a"), prbs_seed_b=c.get("seed_b"),
+        seed_source=c.get("seed_source", "auto"),
+        seed_diagnostics=c.get("seed_diagnostics"),
+        seed_bit_offset=c.get("seed_bit_offset"),
+        seed_bit_offset_a=c.get("seed_bit_offset_a"),
+        seed_bit_offset_b=c.get("seed_bit_offset_b"),
+        seed_ok=seed_ok, record_kind=c.get("record_kind"),
+        pattern_match_warning=pattern_warning,
+        gray_mapping=c["gray_mapping"],
+        window_source="auto" if window == "auto" else "user",
+        ffe_pre_cursor=int(res["n_pre"]), ffe_post_cursor=int(res["n_post"]),
+        ffe_tap_count=n_t, ffe_optimisation=desc,
+        standard=profile.name, standard_label=profile.label,
+        standard_citation=profile.citation,
+        standard_is_draft=bool(profile.draft),
+        # the tap count is always the reference-receiver definition (draft:
+        # fixed 15-tap FFE) or the explicit request; only the main-tap
+        # position inside the allowed range is optimised
+        ffe_geometry_locked=bool(ffe_geometry_explicit or profile.draft),
+        ffe_geometry_explicit=bool(ffe_geometry_explicit),
+        ffe_bounds_enabled=bool(cfg.bounded),
+        ffe_bounds_used=bool(cfg.bounded),
+        ffe_bounds_tap_count=n_t if cfg.bounded else None,
+        ffe_bounds_main_index=int(res["main_index"]) if cfg.bounded else None,
+        ffe_bounds_strategy="standard_min_tdecq" if cfg.bounded else None,
+        chosen_strategy="standard_min_tdecq",
+        ffe_reason=desc, selection_tier="standard",
+        selected_family="min_tdecq",
+        sigma_method="hist_unlabelled_adjacent",
+        threshold_mode=threshold_mode,
+        metric_credible=bool(credible),
+        metric_credible_reason=cred_reason,
+        cdr_estimated=int(c["cdr0"]), offset_estimated=int(c["off"]),
+        elapsed=time.time() - t_start,
+        tdecq_mode="standard",
+        rx_frontend=(dict(model="bessel_thomson_4", bw_over_baud=float(
+            rx_bw_over_baud), bw_ghz=float(rx_bw_over_baud) * rate_gbps / 2.0,
+            dispersion="not applied (channel property)")
+            if domain != "electrical" else None),
+        std=dict(
+            lag=int(res["lag"]), window=int(res["window"]),
+            shift=int(res["shift"]), sym_start=int(res["sym_start"]),
+            sym_stop=int(res["sym_stop"]),
+            eye_centre=float(res["eye_centre"]),
+            window_left=res["window_left"], window_right=res["window_right"],
+            sigma_L=float(res["sigma_L"]), sigma_R=float(res["sigma_R"]),
+            sigma_s=float(cfg.sigma_s), oma=float(res["oma"]),
+            pave=float(res["pave"]),
+            pth=[float(x) for x in np.asarray(res["pth"]).reshape(-1)],
+            b1=float(res["b1"]), taps=[float(x) for x in w],
+            feasible=bool(res["feasible"]),
+            level_source=res["level_source"],
+            rx_model="bt4" if domain != "electrical" else "none",
+            rx_bw_over_baud=float(rx_bw_over_baud),
+            candidates=res["candidates"], config=res["config"]),
+    )
+    seed_diag.emit("result", pattern=c["ptype"], seed_ok=seed_ok,
+                   cdr_phase=int(c["cdr0"]), selected_phase=int(ctx["cdr"]),
+                   offset=int(c["off"]), actual_ser=float(res["ser"]),
+                   metric_db=float(res["metric_db"]),
+                   threshold_mode=threshold_mode)
+    if verbose:
+        print("%-28s mode=standard N=%d main=%d %s=%.4f ser=%.4g" %
+              (_ascii_text(case_id or os.path.basename(path)), n_t,
+               res["main_index"],
+               "tecq" if domain == "electrical" else "tdecq",
+               res["metric_db"], res["ser"]))
+    return build_json(case_id or "auto", ctx)
+
+
 def _resample_virtuoso(t, s, n_ui, spu, ui, ptype, nom, rate_gbps):
     """Resample a Virtuoso export; choose the grid phase automatically.
 
@@ -4263,9 +5418,16 @@ def _resample_virtuoso(t, s, n_ui, spu, ui, ptype, nom, rate_gbps):
             score = _prbs13_dual_score(v, spu, n_ui, nom)
         elif ptype.startswith("prbs"):
             # generic single-LFSR PRBSn: score by the decoded-bit LFSR
-            # recurrence consistency (seed-independent and fast)
-            n = int(ptype[4:])
-            taps = patterns.prbsn_taps(n)
+            # recurrence consistency (seed-independent and fast).  PRBSnQ and
+            # user-defined polynomials score with their own taps and level
+            # map only.
+            n, taps = parse_prbsn(ptype)
+            forced = _prbsn_opts(ptype)["symbol_maps"]
+            if forced:
+                # the waveform is not polarity-normalised yet: also score the
+                # inverted record (level k read as level 3-k)
+                forced = tuple(forced) + tuple(
+                    tuple(m[3 - k] for k in range(4)) for m in forced)
             centers = np.percentile(v_probe, [5.0, 35.0, 65.0, 95.0])
             for _ in range(15):
                 cls = np.argmin(np.abs(v_probe[:, None] - centers[None, :]), axis=1)
@@ -4277,9 +5439,10 @@ def _resample_virtuoso(t, s, n_ui, spu, ui, ptype, nom, rate_gbps):
                 centers = nxt
             raw = np.argmin(np.abs(v_probe[:, None] - centers[None, :]), axis=1)
             score = 0.0
-            for symbol_map in itertools.permutations(range(4)):
+            for symbol_map in (forced or itertools.permutations(range(4))):
                 bits = patterns.unpack_symbols(_map_symbols(raw, symbol_map))
-                for tap_set in (taps, DUAL13_TAPS if n == 13 else taps):
+                for tap_set in ((taps,) if forced else
+                                (taps, DUAL13_TAPS if n == 13 else taps)):
                     res = patterns.recover_seed(bits, n, tap_set)
                     if res:
                         score = max(score, float(res[2]))
@@ -4496,6 +5659,9 @@ def build_json(cid, ctx):
     pes1, pes2, pes3 = [float(x) for x in post_eye["ES"]]
     out = {
         "id": str(cid),
+        "standard": str(r.get("standard", standards.DEFAULT_STANDARD)),
+        "standard_label": str(r.get("standard_label", "")),
+        "standard_is_draft": bool(r.get("standard_is_draft", False)),
         mkey + "_db": float(r["metric"]),
         mkey + "_raw_db": float(r["raw_metric"]),
         mkey + "_pre_db": float(r["pre_metric"]),
@@ -4594,15 +5760,27 @@ def build_json(cid, ctx):
             r.get("validation_cross_window_seed_acc"),
         "validation_n_candidates": r.get("validation_n_candidates"),
         "validation_n_validated": r.get("validation_n_validated"),
-        "ffe_bounds_enabled": bool(r.get("ffe_bounds_enabled", False)),
-        "ffe_bounds_used": bool(r.get("ffe_bounds_used", False)),
-        "ffe_bounds_tap_count": r.get("ffe_bounds_tap_count"),
-        "ffe_bounds_main_index": r.get("ffe_bounds_main_index"),
-        "ffe_bounds_strategy": r.get("ffe_bounds_strategy"),
-        "ffe_bounds_at_bound": r.get("ffe_bounds_at_bound"),
-        "ffe_bounds_score_bounded": r.get("ffe_bounds_score_bounded"),
-        "ffe_bounds_score_main": r.get("ffe_bounds_score_main"),
     }
+    # Draft-only fields (IEEE P802.3dj bounded multi-tap FFE + one-tap DFE).
+    # The published-standard profile never emits them, so a 2022 measurement
+    # cannot be confused with a draft measurement (issue: standard/draft
+    # separation).
+    if bool(r.get("standard_is_draft", False)):
+        out["dfe_b1"] = float(r.get("dfe_b1", 0.0))
+        out["dfe_enabled"] = bool(float(r.get("dfe_b1", 0.0)) > 0.0)
+        out["dfe_feedback_source"] = "aligned_ideal_previous_symbol"
+        out["dfe_oma_reference"] = "FFE_input_OMA_over_2"
+        out["ffe_bounds_enabled"] = bool(r.get("ffe_bounds_enabled", False))
+        out["ffe_bounds_used"] = bool(r.get("ffe_bounds_used", False))
+        out["ffe_bounds_tap_count"] = r.get("ffe_bounds_tap_count")
+        out["ffe_bounds_main_index"] = r.get("ffe_bounds_main_index")
+        out["ffe_bounds_strategy"] = r.get("ffe_bounds_strategy")
+        out["ffe_bounds_at_bound"] = r.get("ffe_bounds_at_bound")
+        out["ffe_bounds_score_bounded"] = r.get("ffe_bounds_score_bounded")
+        out["ffe_bounds_score_main"] = r.get("ffe_bounds_score_main")
+        out["ffe_geometry_locked"] = bool(r.get("ffe_geometry_locked", False))
+        out["ffe_geometry_explicit"] = bool(
+            r.get("ffe_geometry_explicit", False))
     if "ffe_bounds_satisfied" in r:
         out["ffe_bounds_satisfied"] = bool(r["ffe_bounds_satisfied"])
         out["ffe_bounds_violations"] = int(r["ffe_bounds_violations"])
@@ -4618,17 +5796,42 @@ def build_json(cid, ctx):
         out["ffe_bounds_forced"] = r.get("ffe_bounds_forced")
         out["metric_credible"] = bool(r.get("metric_credible", True))
         out["metric_credible_reason"] = r.get("metric_credible_reason")
+        for key in (
+                "dfe_b1_at_bound", "dfe_b1_unbounded_selected",
+                "dfe_b1_unbounded_selected_count", "dfe_diff_ffe_term",
+                "dfe_diff_b1_dominant", "ffe_overlimit_tap_count",
+                "ffe_overlimit_tap_total", "ffe_overlimit_max_severity",
+                "ffe_unconstrained_overlimit_count",
+                "ffe_unconstrained_tap_total",
+                "ffe_unconstrained_max_severity",
+                "ffe_eye_lid_thickness", "ffe_eye_lid_main",
+                "ffe_eye_lid_improvement", "ffe_side_tap_l1",
+                "ffe_side_tap_max_abs"):
+            if key in r:
+                out[key] = r[key]
     elif r.get("metric_credible") is False:
         # Default path: expose the credibility diagnostic only when the guard
         # fired, keeping the release default JSON field-identical.
         out["metric_credible"] = False
         out["metric_credible_reason"] = r.get("metric_credible_reason")
+    if r.get("tdecq_mode") == "standard":
+        out["tdecq_mode"] = "standard"
+        out["metric_credible"] = bool(r.get("metric_credible", True))
+        out["metric_credible_reason"] = r.get("metric_credible_reason")
+        out["standard_measurement"] = r["std"]
+        if bool(r.get("standard_is_draft", False)):
+            out["ffe_bounds_satisfied"] = bool(r["std"]["feasible"])
     out["elapsed_sec"] = float(r["elapsed"])
     if dom == "optical":
         out["ER_dB"] = float(10 * np.log10(rx[3] / rx[0])) if rx[0] > 0 else None
         out["post_ffe_ER_dB"] = float(10 * np.log10(post_lv[3] / post_lv[0])) if post_lv[0] > 0 else None
-        out["dispersion_ps_per_nm"] = 0.8
-        out["wavelength_nm"] = 1310.0
+        if r.get("rx_frontend"):
+            out["reference_receiver"] = dict(r["rx_frontend"])
+            out["dispersion_ps_per_nm"] = None
+            out["wavelength_nm"] = None
+        else:
+            out["dispersion_ps_per_nm"] = 0.8
+            out["wavelength_nm"] = 1310.0
         out["pre_FFE_OMA_" + unit] = float(rx[3] - rx[0])
         out["pre_FFE_P_ave_" + unit] = float(rx.mean())
     else:
@@ -4641,7 +5844,8 @@ def build_json(cid, ctx):
 
 def prepare_plot_data(path, pattern="auto", rate_gbps=112, domain="electrical",
                       samples_per_ui="auto", window="auto", case_id=None,
-                      ffe_pre_cursor=0, ffe_post_cursor=4, tap_weights=None):
+                      ffe_pre_cursor=0, ffe_post_cursor=4, tap_weights=None,
+                      dfe_b1=0.0, standard_measurement=None):
     """Lightweight re-analysis for diagnostic plots (case_id diagnostic only).
 
     Reuses the shared pipeline front-end (:func:`_run_core`) and only adds
@@ -4653,7 +5857,33 @@ def prepare_plot_data(path, pattern="auto", rate_gbps=112, domain="electrical",
     Returns
     -------
     dict with v, M, Mj, tru, cdr, w, nom, spu, n_ui, domain, ptype, meta.
+
+    ``standard_measurement`` (the ``standard_measurement`` block of a
+    standard-mode JSON) rebuilds the exact equalised eye of that result
+    (IEEE tap direction); ``Mj`` is then None.
     """
+    if standard_measurement is not None:
+        from . import tdecq_std
+        c = _run_core(path, pattern=pattern, rate_gbps=rate_gbps,
+                      domain=domain, samples_per_ui=samples_per_ui,
+                      window=window, ffe_pre_cursor=STD_LOCK_PRE,
+                      ffe_post_cursor=STD_LOCK_POST, release_fold=False,
+                      rx_model=("bt4" if standard_measurement.get(
+                          "rx_model", "bt4") == "bt4" else "legacy"),
+                      rx_bw_over_baud=float(standard_measurement.get(
+                          "rx_bw_over_baud", REF_RX_BW_OVER_BAUD)))
+        sm = standard_measurement
+        z, labels, centre = tdecq_std.equalized_eye(c["v"], c["spu"],
+                                                    c["tru"], sm)
+        # raw waveform re-based so sample k*spu+p lines up with eye row k,
+        # phase p (main-cursor slot of the row's symbol)
+        start = ((int(sm["sym_start"]) + int(sm["lag"])) * c["spu"]
+                 + int(sm["shift"]))
+        v_al = np.asarray(c["v"], dtype=float)[max(0, start):]
+        return dict(v=v_al, M=z, Mj=None, tru=labels, cdr=centre,
+                    w=np.asarray(sm["taps"], dtype=float), nom=c["nom"],
+                    spu=c["spu"], n_ui=c["n_ui"], domain=domain,
+                    ptype=c["ptype"], meta=c["meta"])
     c = _run_core(path, pattern=pattern, rate_gbps=rate_gbps, domain=domain,
                   samples_per_ui=samples_per_ui, window=window,
                   ffe_pre_cursor=ffe_pre_cursor, ffe_post_cursor=ffe_post_cursor)
@@ -4676,6 +5906,10 @@ def prepare_plot_data(path, pattern="auto", rate_gbps=112, domain="electrical",
         if wt.size == Mj.shape[0] and bool(np.all(np.isfinite(wt))):
             w = wt.copy()
     M = np.tensordot(Mj, w, axes=(0, 0))
+    if float(dfe_b1) > 0.0:
+        in_lv = eq.levels_at(Mj[ffe_pre_cursor], tru, cdr)
+        oma_input = float(in_lv[3] - in_lv[0])
+        M = fb.apply_dfe(M, tru, oma_input, float(dfe_b1))
     return dict(v=c["v"], M=M, Mj=Mj, tru=tru, cdr=cdr, w=w, nom=nom,
                 spu=c["spu"], n_ui=c["n_ui"], domain=domain, ptype=c["ptype"],
                 meta=c["meta"])

@@ -87,6 +87,15 @@ def sniff(path: str) -> dict:
             t0 = header_tokens[0].strip().strip('"').lower()
             t1 = header_tokens[1].strip().strip('"').lower()
             is_virtuoso = (t0 == "x" and t1 == "y")
+        # Virtuoso ViVA "Export to CSV" names the columns "<signal> X" /
+        # "<signal> Y" (e.g. "/fPowerW X,/fPowerW Y"); its values are in SI
+        # units (V / W) like the VT() exports.  Only the unit scale uses this
+        # - the record routing keeps keying on ``is_virtuoso``.
+        virtuoso_units = is_virtuoso
+        if not virtuoso_units and len(header_tokens) == 2:
+            t0 = header_tokens[0].strip().strip('"').lower()
+            t1 = header_tokens[1].strip().strip('"').lower()
+            virtuoso_units = (t0.endswith(" x") and t1.endswith(" y"))
         time_header = None
         for tok in header_tokens:
             low = tok.strip().lower()
@@ -99,6 +108,7 @@ def sniff(path: str) -> dict:
             n_header_lines=n_header,
             col_count=len(first_row),
             is_virtuoso=is_virtuoso,
+            virtuoso_units=virtuoso_units,
             time_header=time_header,
         )
 
@@ -207,17 +217,19 @@ def identify_columns(info: dict, data: np.ndarray):
     return data[:, t_col], data[:, s_col], t_col, s_col
 
 
-def auto_scale(signal: np.ndarray, domain: str, is_virtuoso: bool) -> float:
+def auto_scale(signal: np.ndarray, domain: str, is_virtuoso: bool,
+               virtuoso_units: bool = False) -> float:
     """Determine the multiplicative scale to reach the tool's internal units.
 
     Internal units are mV for electrical and mW for optical (SPEC.md 4.8).
 
     Rules (automatic, header-driven only - no amplitude guessing):
 
-    * optical Virtuoso ``p_linear`` exports below 0.01 are treated as W and
-      converted to the internal mW unit; ordinary mW exports keep scale 1.0;
-    * Virtuoso exports (``VT(...) X,VT(...) Y`` or ``x,y`` pairs) are in
-      volts -> x1000 for electrical;
+    * optical records whose peak is below 0.01 are treated as W and
+      converted to the internal mW unit (a TDECQ record never peaks below
+      0.01 mW = -20 dBm); ordinary mW exports keep scale 1.0;
+    * Virtuoso exports (``VT(...) X,VT(...) Y``, ``x,y`` or
+      ``<signal> X,<signal> Y`` pairs) are in volts -> x1000 for electrical;
     * psf2csv electrical exports (``time,out``) are already in mV -> 1.0.
 
     An amplitude heuristic (``swing < 20 => x1000``) is deliberately NOT
@@ -239,10 +251,35 @@ def auto_scale(signal: np.ndarray, domain: str, is_virtuoso: bool) -> float:
     float scale factor.
     """
     if domain != "electrical":
-        if is_virtuoso and signal.size and float(np.nanmax(np.abs(signal))) < 0.01:
+        if signal.size and float(np.nanmax(np.abs(signal))) < 0.01:
             return 1000.0
         return 1.0
-    return 1000.0 if is_virtuoso else 1.0
+    return 1000.0 if (is_virtuoso or virtuoso_units) else 1.0
+
+
+# implausibly small electrical swing (mV) for a PAM4 measurement record
+MIN_PLAUSIBLE_SWING_MV = 1.0
+_POWER_NAME_HINTS = ("power", "pwr", "optpw", "optical")
+
+
+def unit_warnings(s_scaled, domain, header, scale=1.0):
+    """Advisory warnings about the units / domain of a loaded record."""
+    out = []
+    low = (header or "").lower()
+    if domain == "electrical":
+        if any(h in low for h in _POWER_NAME_HINTS):
+            out.append("the CSV signal name (%s) looks like an optical power "
+                       "waveform: use domain 'optical' to get TDECQ in mW"
+                       % (header or "").strip())
+        if s_scaled.size and scale == 1.0:
+            lo, hi = np.nanpercentile(s_scaled, [0.5, 99.5])
+            if float(hi - lo) < MIN_PLAUSIBLE_SWING_MV:
+                out.append("signal swing %.3g mV is implausibly small: the "
+                           "CSV is probably in V (or W) with an unrecognised "
+                           "header, so the reported mV values are scaled by "
+                           "1e-3 (the dB metric is unaffected)"
+                           % float(hi - lo))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -270,9 +307,12 @@ def read_waveform(path: str, domain: str = "electrical"):
     """
     info, data = load_columns(path)
     t, s, t_col, s_col = identify_columns(info, data)
-    scale = auto_scale(s, domain, info["is_virtuoso"])
-    return t, s * scale, dict(
+    scale = auto_scale(s, domain, info["is_virtuoso"],
+                       info.get("virtuoso_units", False))
+    s = s * scale
+    return t, s, dict(
         is_virtuoso=info["is_virtuoso"],
+        unit_warnings=unit_warnings(s, domain, info["header"], scale),
         uniform_grid=grid_is_uniform(t),
         scale=scale,
         n_header_lines=info["n_header_lines"],

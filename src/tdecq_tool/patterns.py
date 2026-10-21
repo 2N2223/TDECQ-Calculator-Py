@@ -30,9 +30,55 @@ OFFICIAL_SSPRQ = os.path.join(DATA_ROOT, "official", "Clause_120_SSPRQ_sequence.
 # LFSR machinery
 # ---------------------------------------------------------------------------
 
+def _gf2_matmul(A, B):
+    """GF(2) matrix product ``A @ B`` for small int arrays."""
+    A = np.asarray(A, dtype=np.int64)
+    B = np.asarray(B, dtype=np.int64)
+    m, k = A.shape
+    k2, p = B.shape
+    assert k == k2
+    C = np.zeros((m, p), dtype=np.int64)
+    for i in range(m):
+        for j in range(p):
+            C[i, j] = int((A[i] & B[:, j]).sum() & 1)
+    return C
+
+
+_OUTPUT_ROWS_CACHE = {}
+
+
+def _output_rows(n, taps, nrows):
+    """GF(2) coefficient rows c_k with ``b_k = c_k . state0`` (state at bit 0).
+
+    c_0 = e_{n-1}; c_{k+1}[a] = c_k[a+1] xor (c_k[0] if a in taps else 0).
+
+    Results are memoised per ``(n, taps, nrows)``: seed-recovery scans call
+    this tens of thousands of times with identical arguments (one per
+    decoded phase), so the cache removes the dominant recovery cost.
+    """
+    key = (int(n), tuple(sorted(int(t) for t in taps)), int(nrows))
+    cached = _OUTPUT_ROWS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    rows = []
+    c = np.zeros(n, dtype=np.int64)
+    c[n - 1] = 1
+    for _ in range(nrows):
+        rows.append(c.copy())
+        cn = np.zeros(n, dtype=np.int64)
+        if n > 1:
+            cn[:n - 1] = c[1:]
+        for a in taps:
+            if 0 <= int(a) < n:
+                cn[int(a)] ^= c[0]
+        c = cn
+    result = np.array(rows)
+    _OUTPUT_ROWS_CACHE[key] = result
+    return result
+
 
 def lfsr_bits(seed: int, nreg: int, length: int, taps):
-    """Generate ``length`` bits of an LFSR sequence.
+    """Generate ``length`` bits of an LFSR sequence (vectorised).
 
     Parameters
     ----------
@@ -45,17 +91,83 @@ def lfsr_bits(seed: int, nreg: int, length: int, taps):
     -------
     np.ndarray of int64 with values 0/1.  Bit ``nreg-1`` (MSB) is emitted
     first, matching the standard PRBS definition.
+
+    Implementation note: output bits are generated in chunks of
+    ``nreg * _LFSR_NBLOCKS`` bits.  Within a chunk every output bit is a
+    fixed GF(2) linear form of the chunk-start state (precomputed
+    ``ROWS`` matrix, ``ROWS`` stacked from the per-block output forms
+    ``R @ A**b``); between chunks the state advances by the precomputed
+    ``T**(nreg*_LFSR_NBLOCKS)`` matrix.  This is bit-exact with the
+    historical per-bit loop (see ``tests/test_lfsr_vectorized.py``) and
+    ~10x faster on long streams.
     """
-    mask = (1 << nreg) - 1
-    st = seed & mask
+    length = int(length)
+    if length <= 0:
+        return np.empty(0, dtype=np.int64)
+    if int(nreg) < 1:
+        raise ValueError("nreg must be >= 1")
+    rows, adv = _lfsr_chunk_matrices(int(nreg), taps)
+    K = rows.shape[0]
+    vec = np.array([(int(seed) >> i) & 1 for i in range(nreg)],
+                   dtype=np.int64)
     out = np.empty(length, dtype=np.int64)
-    for i in range(length):
-        out[i] = (st >> (nreg - 1)) & 1
-        fb = 0
-        for t in taps:
-            fb ^= (st >> t) & 1
-        st = ((st << 1) | fb) & mask
+    pos = 0
+    while pos < length:
+        blk = min(K, length - pos)
+        out[pos:pos + blk] = (rows[:blk] @ vec) % 2
+        vec = (adv @ vec) % 2
+        pos += blk
     return out
+
+
+_LFSR_NBLOCKS = 64
+_LFSR_CHUNK_CACHE = {}
+
+
+def _lfsr_chunk_matrices(nreg, taps):
+    """(ROWS, ADVANCE) GF(2) matrices for chunked LFSR output generation.
+
+    ``ROWS`` has ``nreg * _LFSR_NBLOCKS`` rows; row ``k`` is the GF(2)
+    coefficient vector of output bit ``k`` in terms of the chunk-start
+    state bits (column ``i`` = state bit ``i``, LSB = 0).  ``ADVANCE``
+    maps the chunk-start state to the state one chunk later.
+    """
+    key = (int(nreg), tuple(sorted(int(t) for t in taps)))
+    cached = _LFSR_CHUNK_CACHE.get(key)
+    if cached is not None:
+        return cached
+    n = int(nreg)
+    R = _output_rows(n, taps, n)          # one block of outputs
+    # per-step state transition T
+    T = np.zeros((n, n), dtype=np.int64)
+    for i in range(1, n):
+        T[i, i - 1] = 1
+    for t in taps:
+        if 0 <= int(t) < n:
+            T[0, int(t)] = 1
+
+    def _gf2_power(M, e):
+        P = np.eye(M.shape[0], dtype=np.int64)
+        base = M
+        while e:
+            if e & 1:
+                P = _gf2_matmul(P, base)
+            base = _gf2_matmul(base, base)
+            e >>= 1
+        return P
+
+    Tn = _gf2_power(T, n)                 # one block = n output steps
+    nb = int(_LFSR_NBLOCKS)
+    rows_blocks = []
+    Mb = np.eye(n, dtype=np.int64)        # Tn**0
+    for _b in range(nb):
+        rows_blocks.append(R @ Mb % 2)
+        Mb = _gf2_matmul(Mb, Tn)
+    rows = np.vstack(rows_blocks)
+    # ADVANCE = T**(n*nb) via binary powering
+    A = _gf2_power(T, n * nb)
+    _LFSR_CHUNK_CACHE[key] = (rows, A)
+    return rows, A
 
 
 def prbs_symbols(bits: np.ndarray, n: int) -> np.ndarray:
@@ -205,6 +317,202 @@ def _parse_prbsn_name(ptype):
     return None
 
 
+# ---------------------------------------------------------------------------
+# IEEE 802.3 Gray-coded PRBSnQ (Clause 120.5.11.2: PRBS13Q / PRBS31Q)
+# ---------------------------------------------------------------------------
+# Generator polynomials in the 802.3 sense (x^k = k-bit delay), i.e. the bit
+# stream obeys  b[n] = XOR_k b[n-k]  over the polynomial terms:
+#   PRBS13: 1 + x + x^2 + x^12 + x^13   -> taps (12, 11, 1, 0) here
+#   PRBS31: 1 + x^28 + x^31             -> taps (30, 27)
+# (``lfsr_bits`` tap t is a delay of t+1 bits.)  Consecutive bit pairs
+# (first bit = MSB) are Gray coded onto the PAM4 levels 00->0, 01->1,
+# 11->2, 10->3.  PRBS13Q has an odd bit period, so its symbol period is 8191
+# (two bit periods); PRBS31Q is a linear 2**31-1 symbol stream.
+#
+# Note: the legacy names ``prbs13`` / ``prbs31`` keep the project's binary
+# (non-Gray) mapping and, for PRBS13, the x^13+x^12+x^10+x^9+1 polynomial
+# used by ``signal_gen`` - they are NOT the 802.3 PRBS13Q/PRBS31Q patterns.
+PRBSQ_TAPS = {13: (12, 11, 1, 0), 31: (30, 27)}
+# physical PAM4 level index -> logical (binary bit-pair) symbol
+GRAY_PHYS_TO_LOGICAL = (0, 1, 3, 2)
+_GRAY_LOGICAL_TO_PHYS = np.array([0, 1, 3, 2], dtype=np.int64)  # self-inverse
+
+
+def parse_prbsq_name(ptype):
+    """``(n, taps)`` for an 802.3 Gray-coded ``prbs13q`` / ``prbs31q`` name."""
+    s = str(ptype or "").strip().lower()
+    if s.startswith("prbs") and s.endswith("q") and s[4:-1].isdigit():
+        n = int(s[4:-1])
+        if n in PRBSQ_TAPS:
+            return n, PRBSQ_TAPS[n]
+    return None
+
+
+def gray_encode_symbols(logical):
+    """Binary bit-pair symbols (2*MSB+LSB) -> Gray-coded PAM4 level index."""
+    return _GRAY_LOGICAL_TO_PHYS[np.asarray(logical, dtype=np.int64)]
+
+
+def prbsq_symbols(n, n_sym, seed=1, start_bit=0):
+    """``n_sym`` PAM4 levels of PRBS{n}Q starting ``start_bit`` bits after
+    the LFSR state ``seed``."""
+    q = parse_prbsq_name("prbs%dq" % int(n))
+    if q is None:
+        raise ValueError("no 802.3 PRBS%dQ definition" % int(n))
+    _, taps = q
+    bits = lfsr_bits(int(seed), int(n), int(start_bit) + 2 * int(n_sym), taps)
+    return gray_encode_symbols(pack_bits(bits[int(start_bit):]))
+
+
+# ---------------------------------------------------------------------------
+# user-defined single-LFSR PRBS polynomials
+# ---------------------------------------------------------------------------
+# Pattern names ``prbs:<poly>`` (binary bit-pair mapping, the project's
+# ``prbsN`` convention) and ``prbsq:<poly>`` (802.3 Gray mapping, like
+# ``prbs13q``) select an arbitrary primitive feedback polynomial; an explicit
+# order (``prbs13:<poly>`` / ``prbs13q:<poly>``) must match the degree.
+# ``<poly>`` is written in the same delay convention as the built-in table,
+# e.g. ``x^13+x^12+x^10+x^9+1`` (taps 12, 11, 9, 8), or as the list of
+# non-zero exponents ``13,12,10,9``.  The canonical name is
+# ``prbs<n>[q]:<poly>`` with the terms in descending order.
+CUSTOM_PRBS_MAX_ORDER = 31
+
+
+def parse_polynomial(text):
+    """``(n, taps)`` of a feedback polynomial (raises ValueError)."""
+    raw = str(text or "").strip().lower().replace(" ", "").replace("**", "^")
+    if not raw:
+        raise ValueError("empty PRBS polynomial")
+    exps = []
+    if "x" not in raw:
+        # exponent list: "13,12,10,9" (the constant term is implied)
+        try:
+            exps = [int(t) for t in raw.strip("[]()").split(",") if t != ""]
+        except ValueError:
+            raise ValueError("cannot parse PRBS polynomial %r" % text)
+        exps.append(0)
+    else:
+        for term in raw.split("+"):
+            if term == "1":
+                exps.append(0)
+            elif term == "x":
+                exps.append(1)
+            elif term.startswith("x") and term[1:].lstrip("^").isdigit():
+                exps.append(int(term[1:].lstrip("^")))
+            else:
+                raise ValueError("cannot parse term %r of PRBS polynomial %r"
+                                 % (term, text))
+    if len(set(exps)) != len(exps):
+        raise ValueError("PRBS polynomial %r repeats a term" % text)
+    if 0 not in exps:
+        raise ValueError("PRBS polynomial %r needs the constant term +1"
+                         % text)
+    n = max(exps)
+    if not (2 <= n <= CUSTOM_PRBS_MAX_ORDER):
+        raise ValueError("PRBS polynomial degree must be 2..%d, got %d"
+                         % (CUSTOM_PRBS_MAX_ORDER, n))
+    if any(e < 0 for e in exps):
+        raise ValueError("negative exponent in PRBS polynomial %r" % text)
+    taps = tuple(sorted(e - 1 for e in exps if e > 0))
+    return n, taps
+
+
+def _poly_mulmod(a, b, f, n):
+    r = 0
+    while b:
+        if b & 1:
+            r ^= a
+        b >>= 1
+        a <<= 1
+        if a >> n & 1:
+            a ^= f
+    return r
+
+
+def _poly_powmod(e, f, n):
+    """x**e mod f over GF(2) (polynomials as int bit masks)."""
+    result, base = 1, 2 if n > 1 else 2 ^ f
+    while e:
+        if e & 1:
+            result = _poly_mulmod(result, base, f, n)
+        base = _poly_mulmod(base, base, f, n)
+        e >>= 1
+    return result
+
+
+def _prime_factors(m):
+    out, p = [], 2
+    while p * p <= m:
+        if m % p == 0:
+            out.append(p)
+            while m % p == 0:
+                m //= p
+        p += 1
+    if m > 1:
+        out.append(m)
+    return out
+
+
+def is_primitive(n, taps):
+    """Whether the LFSR ``(n, taps)`` has the maximal period 2**n - 1."""
+    f = 1
+    for t in taps:
+        f |= 1 << (int(t) + 1)
+    if not f >> n & 1:
+        return False
+    order = (1 << n) - 1
+    if _poly_powmod(order, f, n) != 1:
+        return False
+    return all(_poly_powmod(order // p, f, n) != 1
+               for p in _prime_factors(order))
+
+
+def custom_prbs_name(n, taps, gray=False):
+    """Canonical pattern name of a user-defined PRBS polynomial."""
+    return "prbs%d%s:%s" % (int(n), "q" if gray else "",
+                            prbs_polynomial_str(n, taps))
+
+
+def parse_custom_prbs_name(ptype, strict=True):
+    """``(n, taps, gray)`` for a ``prbs[N][q]:<poly>`` name, else None.
+
+    Raises ValueError for a malformed or non-primitive polynomial when
+    ``strict`` (the public validation path); returns None otherwise.
+    """
+    s = str(ptype or "").strip().lower()
+    if not s.startswith("prbs") or ":" not in s:
+        return None
+    head, poly = s.split(":", 1)
+    order = head[4:]
+    gray = order.endswith("q")
+    if gray:
+        order = order[:-1]
+    if order and not order.isdigit():
+        return None
+    try:
+        n, taps = parse_polynomial(poly)
+        if order and int(order) != n:
+            raise ValueError("pattern %r: PRBS order %s does not match the "
+                             "polynomial degree %d" % (ptype, order, n))
+        if not is_primitive(n, taps):
+            raise ValueError(
+                "PRBS polynomial %s is not primitive: its LFSR period is "
+                "shorter than 2^%d-1, so it is not a PRBS%d"
+                % (prbs_polynomial_str(n, taps), n, n))
+    except ValueError:
+        if strict:
+            raise
+        return None
+    return n, taps, gray
+
+
+def custom_prbs_symbols(n, taps, gray, n_sym, seed=1, start_bit=0):
+    """``n_sym`` PAM4 levels of a user-defined PRBS (canonical seed 1)."""
+    bits = lfsr_bits(int(seed), int(n), int(start_bit) + 2 * int(n_sym), taps)
+    sym = pack_bits(bits[int(start_bit):])
+    return gray_encode_symbols(sym) if gray else sym
+
+
 def pattern_symbols(ptype: str, n: int) -> np.ndarray:
     """Generate ``n`` symbols of pattern ``ptype``.
 
@@ -220,6 +528,23 @@ def pattern_symbols(ptype: str, n: int) -> np.ndarray:
         return prbs13_symbols(n)
     if ptype == "ssprq":
         return ssprq_symbols(n)
+    c = parse_custom_prbs_name(ptype, strict=False)
+    if c is not None:
+        nc, taps, gray = c
+        period = (1 << nc) - 1
+        if period > 10 ** 6:
+            return custom_prbs_symbols(nc, taps, gray, n)
+        return custom_prbs_symbols(nc, taps, gray, period)[
+            np.arange(n) % period]
+    q = parse_prbsq_name(ptype)
+    if q is not None:
+        # canonical seed 1; the 8191-symbol PRBS13Q period is exact, PRBS31Q
+        # is generated linearly (no wrap)
+        nq = q[0]
+        period = (1 << nq) - 1
+        if period > 10 ** 6:
+            return prbsq_symbols(nq, n)
+        return prbsq_symbols(nq, period)[np.arange(n) % period]
     g = _parse_prbsn_name(ptype)
     if g is not None:
         nn, taps = g
@@ -239,6 +564,12 @@ def pattern_period(ptype: str) -> int:
         return 65535
     if ptype == "prbs13":
         return 8191
+    c = parse_custom_prbs_name(ptype, strict=False)
+    if c is not None:
+        return (1 << c[0]) - 1
+    q = parse_prbsq_name(ptype)
+    if q is not None:
+        return (1 << q[0]) - 1
     g = _parse_prbsn_name(ptype)
     if g is not None:
         return (1 << g[0]) - 1
@@ -264,7 +595,9 @@ def align_symbols_fft(dec: np.ndarray, psym: np.ndarray, period: int) -> int:
 
     Parameters
     ----------
-    dec  : decoded symbol array (length <= period for exactness).
+    dec  : decoded symbol array (longer arrays are truncated to one period -
+        a single period is always sufficient to pin the circular offset of a
+        periodic pattern).
     psym : full periodic reference symbol array (length = period).
     period : pattern period.
 
@@ -272,6 +605,9 @@ def align_symbols_fft(dec: np.ndarray, psym: np.ndarray, period: int) -> int:
     -------
     int offset ``off`` with ``tru[k] = psym[(k + off) % period]``.
     """
+    period = int(period)
+    if len(dec) > period:
+        dec = dec[:period]
     n = len(dec)
     best = (-1, 0)
     for lv in range(4):
@@ -609,20 +945,6 @@ def find_clean_state(bits, n, taps, min_run=None):
     return start, state
 
 
-def _gf2_matmul(A, B):
-    """GF(2) matrix product ``A @ B`` for small int arrays."""
-    A = np.asarray(A, dtype=np.int64)
-    B = np.asarray(B, dtype=np.int64)
-    m, k = A.shape
-    k2, p = B.shape
-    assert k == k2
-    C = np.zeros((m, p), dtype=np.int64)
-    for i in range(m):
-        for j in range(p):
-            C[i, j] = int((A[i] & B[:, j]).sum() & 1)
-    return C
-
-
 def _gf2_invert(T):
     """GF(2) matrix inverse by Gauss-Jordan elimination."""
     n = T.shape[0]
@@ -677,59 +999,37 @@ def _gf2_identity(n):
     return np.eye(n, dtype=np.int64)
 
 
+_STATE_BACK_CACHE = {}
+
+
 def state_shift_back(state, n, taps, k):
     """LFSR register state ``k`` steps earlier in the sequence.
 
     Returns the state whose sequence, after ``k`` forward steps, equals
-    ``state``.  Implemented with a GF(2) matrix power ``(T^-1)^k``.
-
-    Parameters
-    ----------
-    state : int register state.
-    n : register width.
-    taps : feedback taps.
-    k : number of backward steps (>= 0).
-
-    Returns
-    -------
-    int state.
+    ``state``.  Implemented with a GF(2) matrix power ``(T^-1)^k``; the
+    per-``(n, taps, k)`` results are memoised (the seed scans call this
+    repeatedly with a small set of shifts).
     """
     mask = (1 << n) - 1
     if k <= 0:
         return state & mask
-    T = _lfsr_transition(n, taps)
-    Tinv = _gf2_invert(T)
-    M = _gf2_identity(n)
-    base = Tinv
-    e = int(k)
-    while e:
-        if e & 1:
-            M = _gf2_matmul(M, base)
-        base = _gf2_matmul(base, base)
-        e >>= 1
+    key = (int(n), tuple(sorted(int(t) for t in taps)), int(k))
+    M = _STATE_BACK_CACHE.get(key)
+    if M is None:
+        T = _lfsr_transition(n, taps)
+        Tinv = _gf2_invert(T)
+        M = _gf2_identity(n)
+        base = Tinv
+        e = int(k)
+        while e:
+            if e & 1:
+                M = _gf2_matmul(M, base)
+            base = _gf2_matmul(base, base)
+            e >>= 1
+        _STATE_BACK_CACHE[key] = M
     vec = np.array([(state >> i) & 1 for i in range(n)], dtype=np.int64)
     out = (M @ vec) % 2
     return int((out * (1 << np.arange(n))).sum()) & mask
-
-
-def _output_rows(n, taps, nrows):
-    """GF(2) coefficient rows c_k with ``b_k = c_k . state0`` (state at bit 0).
-
-    c_0 = e_{n-1}; c_{k+1}[a] = c_k[a+1] xor (c_k[0] if a in taps else 0).
-    """
-    rows = []
-    c = np.zeros(n, dtype=np.int64)
-    c[n - 1] = 1
-    for _ in range(nrows):
-        rows.append(c.copy())
-        cn = np.zeros(n, dtype=np.int64)
-        if n > 1:
-            cn[:n - 1] = c[1:]
-        for a in taps:
-            if 0 <= int(a) < n:
-                cn[int(a)] ^= c[0]
-        c = cn
-    return np.array(rows)
 
 
 def _gf2_eliminate(rows, b, n):
@@ -792,6 +1092,111 @@ def _gf2_solve(bits, n, taps):
     if float((chk == bits[:chk_len]).mean()) < 0.95:
         return None
     return int((x * (1 << np.arange(n))).sum())
+
+
+def clean_run_candidates(bits, n, taps, max_candidates=64):
+    """Enumerate candidate LFSR states from every clean recurrence run.
+
+    Where :func:`find_clean_state` returns only the longest run of
+    recurrence-satisfying windows, a *noisy* decode (a few percent wrong
+    bits) breaks the long run into many short clean runs - each one still
+    likely to start with an error-free ``n``-bit window and therefore to
+    hold an exact register state.  This helper returns (start, state) for
+    every clean-run start, deterministically subsampled across the record
+    when there are more than ``max_candidates``.
+
+    Parameters
+    ----------
+    bits : np.ndarray of int64 0/1.
+    n, taps : PRBSn parameters.
+    max_candidates : deterministic cap on the number of candidates.
+
+    Returns
+    -------
+    list of (start, state) tuples, ordered by record position.
+    """
+    bits = np.asarray(bits, dtype=np.int64)
+    L = len(bits)
+    if L < 2 * n + 2:
+        return []
+    ok = (recurrence_residual(bits, n, taps) == 0).astype(np.int8)
+    pad = np.concatenate([[0], ok, [0]])
+    d = np.diff(pad)
+    starts = np.nonzero(d == 1)[0]
+    if len(starts) == 0:
+        return []
+    if len(starts) > max_candidates:
+        idx = np.linspace(0, len(starts) - 1, max_candidates).astype(np.int64)
+        starts = starts[idx]
+    out = []
+    for s in starts:
+        s = int(s)
+        state = 0
+        for j in range(n):
+            state = (state << 1) | int(bits[s + j])
+        out.append((s, state))
+    return out
+
+
+def recover_seed_noisy(bits, n, taps, match_min=0.62, max_candidates=64):
+    """Noise-tolerant LFSR state recovery for imperfectly decoded streams.
+
+    :func:`recover_seed` is exact: it requires either a clean run whose
+    regenerated stream reproduces >= 95% of the following ``8n`` bits, or an
+    exact GF(2) solve.  Both fail once the decode carries a few percent of
+    bit errors: the recurrence consistency of a stream with per-bit error
+    rate ``p`` collapses to ``~(1-p)**(n+1)`` (chance level already for
+    p >= 5% at n = 11..13), even though the underlying register state is
+    perfectly recoverable.
+
+    This helper instead scores every clean-run candidate state by the
+    *bit-match fraction* of its regenerated stream against the whole decode:
+    a correct state explains ``~1-p`` of all bits (well above 0.5 for any
+    useful decode) while a wrong state decorrelates completely (0.5).  The
+    acceptance gate ``match_min`` is deliberately conservative; callers
+    apply their own decoded-accuracy / equalised-SER credibility gates on
+    top.
+
+    Parameters
+    ----------
+    bits : decoded bit array (0/1) with noise-induced errors.
+    n, taps : PRBSn parameters.
+    match_min : minimum full-stream bit-match fraction to accept.
+    max_candidates : candidate cap (see :func:`clean_run_candidates`).
+
+    Returns
+    -------
+    (seed, bit_offset, match_fraction) or None.
+    """
+    bits = np.asarray(bits, dtype=np.int64)
+    L = len(bits)
+    if L < 2 * n + 8:
+        return None
+    if int(bits.min()) == int(bits.max()):
+        return None
+    cands = clean_run_candidates(bits, n, taps, max_candidates=max_candidates)
+    if not cands:
+        return None
+    best = None
+    for start, state in cands:
+        if state == 0:
+            continue
+        # Score the candidate against the SUFFIX that starts at its own bit
+        # position: a correct state regenerates the record stream from
+        # ``start`` onward, so ``ref[k]`` must equal ``bits[start + k]``.
+        # (Comparing from index 0 would misalign every candidate with
+        # start > 0 and reduce every score to chance.)
+        n_cmp = L - int(start)
+        if n_cmp < min(L // 2, 2 * n + 8):
+            continue
+        ref = lfsr_bits(state, n, n_cmp, taps)
+        match = float((ref == bits[start:]).mean())
+        if best is None or match > best[2]:
+            seed = state_shift_back(state, n, taps, start)
+            best = (int(seed), int(start), match)
+    if best is None or best[2] < float(match_min) or best[0] == 0:
+        return None
+    return best
 
 
 def recover_seed(bits, n, taps):

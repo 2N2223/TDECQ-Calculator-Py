@@ -274,6 +274,27 @@ def _hist_sigma(centers, F, Pth, target=4.8e-4, grid=None):
 _SIG_GRID = np.logspace(-3.0, 3.0, 1200)
 
 
+def window_phase_indices(cdr: int, spu: int):
+    """Return the four discrete phases used by the 0.45/0.55-UI windows."""
+    if int(spu) < 2:
+        raise ValueError("spu must be >= 2")
+
+    def bracket(offset):
+        lo = int(np.floor(offset))
+        hi = int(np.ceil(offset))
+        # On an exactly representable coordinate retain a two-sample window
+        # immediately inside the eye instead of duplicating one sample.
+        if lo == hi:
+            return (lo, lo + 1) if offset < 0.0 else (lo - 1, lo)
+        return lo, hi
+
+    left = tuple((int(cdr) + p) % int(spu)
+                 for p in bracket(-0.05 * int(spu)))
+    right = tuple((int(cdr) + p) % int(spu)
+                  for p in bracket(0.05 * int(spu)))
+    return left, right
+
+
 def window_samples(M: np.ndarray, cdr: int, spu: int):
     """Left/right 0.45/0.55 UI window samples of the equalised eye.
 
@@ -283,27 +304,45 @@ def window_samples(M: np.ndarray, cdr: int, spu: int):
     samples bracketing 0.45 UI and 0.55 UI respectively.  This retains two
     samples per side while correctly scaling for arbitrary samples/UI.
     """
-    if int(spu) < 2:
-        raise ValueError("spu must be >= 2")
-
-    def bracket(offset):
-        lo = int(np.floor(offset))
-        hi = int(np.ceil(offset))
-        # On an exactly representable coordinate retain a two-sample window
-        # immediately *inside* the eye instead of duplicating one sample.
-        # (At 100 spu this is 0.45/0.46 and 0.54/0.55 UI.)
-        if lo == hi:
-            return (lo, lo + 1) if offset < 0.0 else (lo - 1, lo)
-        return lo, hi
-
-    left = bracket(-0.05 * int(spu))
-    right = bracket(0.05 * int(spu))
-    sL_all = np.concatenate([M[:, (cdr + p) % spu] for p in left])
-    sR_all = np.concatenate([M[:, (cdr + p) % spu] for p in right])
+    left, right = window_phase_indices(cdr, spu)
+    sL_all = np.concatenate([M[:, p] for p in left])
+    sR_all = np.concatenate([M[:, p] for p in right])
     return sL_all, sR_all
 
 
+def eye_lid_thickness(M: np.ndarray, tru: np.ndarray, cdr: int,
+                      spu: int) -> float:
+    """Fast normalised vertical eye-lid thickness at 0.45/0.55 UI.
+
+    At each of the four metric-window phases, samples are centred on their
+    own PAM4 class mean.  The pooled within-class RMS is divided by the
+    smallest centre-phase level spacing.  Lower is better.  Normalising by
+    the eye opening prevents a collapsed four-level waveform from appearing
+    artificially thin.
+    """
+    arr = np.asarray(M, dtype=float)
+    labels = np.asarray(tru, dtype=np.int64)
+    lv = levels_at(arr, labels, int(cdr))
+    gaps = np.diff(lv)
+    if (not np.all(np.isfinite(gaps))) or np.min(gaps) <= 1e-12:
+        return float("inf")
+    left, right = window_phase_indices(cdr, spu)
+    residuals = []
+    for phase in left + right:
+        samples = arr[:, phase]
+        phase_lv = _class_means(samples, labels)
+        residuals.append(samples - phase_lv[labels])
+    r = np.concatenate(residuals)
+    if not np.all(np.isfinite(r)):
+        return float("inf")
+    return float(np.sqrt(np.mean(r * r)) / np.min(gaps))
+
+
 def _sigma_from_metric(metric: float, oma: float, ceq: float) -> float:
+    if (not np.isfinite(metric) or not np.isfinite(oma)
+            or not np.isfinite(ceq) or oma <= 0.0 or ceq <= 0.0
+            or abs(float(metric)) >= 3000.0):
+        return float("nan")
     sig = oma / (6.0 * 3.414 * 10.0 ** (metric / 10.0)) / ceq
     return sig if sig > 0 else float("nan")
 
@@ -600,19 +639,18 @@ def crossing_phase(s: np.ndarray, spu: int, thr: float):
     -------
     float or None when no crossing is found.
     """
-    rows = s[:len(s) // spu * spu].reshape(-1, spu)
-    a = rows[:, :-1]
-    b = rows[:, 1:]
-    cr = (a - thr) * (b - thr) < 0
-    pos = []
-    for j in range(spu - 1):
-        col = cr[:, j]
-        if col.any():
-            frac = (thr - a[col, j]) / (b[col, j] - a[col, j])
-            pos.append(j + frac)
-    if not pos:
+    # Work on the continuous sample stream: a crossing between the last
+    # sample of one UI and the first sample of the next is a crossing like
+    # any other.  (Reshaping to (n_ui, spu) rows and scanning only within a
+    # row silently dropped those, which biases the circular mean and returns
+    # None - i.e. phase 0 - for eyes whose transitions sit on the UI grid.)
+    x = np.asarray(s, dtype=float)[:len(s) // spu * spu]
+    a = x[:-1]
+    b = x[1:]
+    k = np.nonzero((a - thr) * (b - thr) < 0)[0]
+    if len(k) == 0:
         return None
-    pos = np.concatenate(pos)
+    pos = (k % spu) + (thr - a[k]) / (b[k] - a[k])
     ph = pos * (2 * np.pi / spu)
     cm = np.arctan2(np.mean(np.sin(ph)), np.mean(np.cos(ph)))
     return (cm / (2 * np.pi) * spu) % spu

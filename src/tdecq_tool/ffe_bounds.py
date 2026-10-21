@@ -9,8 +9,9 @@ that a measurement cannot be won by unbounded noise amplification / over-
 equalisation.  This module implements those constraints as *global algorithm
 constants* (not per-case lookups, not reference-value back-filling): a
 relative-offset bound table that is generic in the tap count ``N`` and the
-main-tap index ``m``, unit-gain normalisation, and the pre/post differential
-limit ``|w(+1) - w(-1)| / w(0) <= 0.25`` (no DFE, ``b(1) = 0``).
+main-tap index ``m``, unit-gain normalisation, the one-tap ideal-symbol DFE
+bound ``0 <= b(1) < 0.3``, and the coupled pre/post differential limit
+``|w(+1)/w(0) - b(1) - w(-1)/w(0)| <= 0.25``.
 
 Bounded optimisation
 --------------------
@@ -25,8 +26,8 @@ final taps must come from a bounded, constrained optimisation:
 * ``progressive_cd``     - constrained projection coordinate descent on the
   TDECQ metric with gradual tap expansion.
 
-Every public function is deterministic and takes ``(N, main_index)`` so it is
-generic in the FFE geometry.  Only numpy + scipy are used.
+Every public function is deterministic and is generic in ``(N, main_index,
+b1)``.  Only numpy + scipy are used.
 """
 from __future__ import annotations
 
@@ -56,7 +57,7 @@ _FAR_BAND = (-0.1, 0.1)  # |n| >= 3
 
 
 class FFEConstraints:
-    """Global, immutable FFE tap-bound configuration.
+    """Global, immutable FFE/DFE bound and candidate configuration.
 
     Attributes
     ----------
@@ -66,16 +67,19 @@ class FFEConstraints:
         main-tap position limits (802.3dj structural caps: 3 pre-cursors,
         13 post-cursors).
     diff_limit : float
-        pre/post differential limit ``|w(+1)-w(-1)|/w(0)`` (b(1) = 0).
+        coupled differential limit
+        ``|w(+1)/w(0)-b(1)-w(-1)/w(0)|``.
     sum_tol, box_tol : float
         feasibility tolerances for the unit-gain and the box checks.
     step, max_iter : float / int
         progressive coordinate-descent step and sweep count.
     extend_delta : float
         minimum metric improvement (dB) to keep a tap-expansion step.
-    lam_dffe, lam_ceq, lam_taps : float
+    lam_dffe, lam_ceq, lam_taps, lam_dfe : float
         selection-score penalties: ``score = metric + lam_dffe*D_FFE +
-        lam_ceq*C_eq + lam_taps*max(0, N-5)`` (dB-scale weights).
+        lam_ceq*C_eq + lam_taps*max(0, N-5) + lam_dfe*[b1>0]``
+        (dB-scale weights).  ``lam_dfe_unbounded`` is the larger penalty for
+        the explicit diagnostic-only ``b1_unbounded`` strategy.
     """
 
     N_candidates = (5, 7, 9)
@@ -90,6 +94,15 @@ class FFEConstraints:
     lam_dffe = 0.2
     lam_ceq = 0.1
     lam_taps = 0.05
+    # One-tap DFE.  b1=0 is the legacy no-DFE receiver; the positive bound
+    # is open, so the 0.3 grid endpoint is represented by nextafter(0.3, 0).
+    b1_min = 0.0
+    b1_max = 0.3
+    b1_open_margin = 1e-6
+    b1_candidates = (0.0, 0.1, 0.2, 0.3)
+    b1_unbounded_max = 1.0
+    lam_dfe = 0.4
+    lam_dfe_unbounded = 1.0
     min_sym = 256
 
     def bound_for(self, n):
@@ -172,9 +185,26 @@ def pool_geometries(N_candidates, requested_pre, requested_post, m0):
     return pairs
 
 
+def manifest_compatible_dfe_gate(feasible_rows):
+    """Keep DFE candidates only when no zero-error no-DFE row exists.
 
-def check_feasible(w, main_index, atol=None):
-    """Check an FFE tap vector against every bound.
+    The release manifest represents the legacy receiver with ``b1=0``.
+    Therefore a DFE improvement must not replace an already error-free
+    no-DFE operating point.  When every no-DFE row still has errors, the
+    original rows are returned and the normal metric/complexity score may
+    select DFE.  The function is deliberately waveform-driven and never
+    inspects a case id or a manifest value.
+    """
+    rows = list(feasible_rows)
+    if any(float(r.get("b1", 0.0)) == 0.0 and int(r.get("ne", 0)) == 0
+           for r in rows):
+        return [r for r in rows if float(r.get("b1", 0.0)) == 0.0]
+    return rows
+
+
+
+def check_feasible(w, main_index, atol=None, b1=0.0, b1_unbounded=False):
+    """Check a joint FFE/one-tap-DFE candidate against every bound.
 
     Parameters
     ----------
@@ -188,6 +218,12 @@ def check_feasible(w, main_index, atol=None):
     atol : float or None
         tolerance used for the box / unit-gain / differential checks
         (defaults to ``FFE_BOUNDS.box_tol``).
+    b1 : float
+        one-tap DFE coefficient.  Zero is the legacy no-DFE receiver;
+        positive values must satisfy the open upper bound ``b1 < 0.3``.
+    b1_unbounded : bool
+        explicit exploration mode which replaces the 0.3 upper bound by the
+        physical guard ``b1 < 1``.  It is never enabled by the default pool.
 
     Returns
     -------
@@ -222,12 +258,101 @@ def check_feasible(w, main_index, atol=None):
                         % (i, i - m, w[i], ub[i]))
     if abs(w.sum() - 1.0) > max(FFE_BOUNDS.sum_tol, atol):
         viol.append("unit gain violated: sum=%.6f" % w.sum())
+    b1 = float(b1)
+    if b1 < -atol:
+        viol.append("DFE b(1) %.6f < 0" % b1)
+    if b1_unbounded:
+        if b1 >= FFE_BOUNDS.b1_unbounded_max - atol:
+            viol.append("unbounded DFE b(1) %.6f >= physical limit 1" % b1)
+    elif b1 > 0.0 and b1 >= FFE_BOUNDS.b1_max - 1e-9:
+        viol.append("DFE b(1) %.6f violates open upper bound 0.3" % b1)
     if m - 1 >= 0 and m + 1 < N and w[m] > 0:
-        d = abs(w[m + 1] - w[m - 1]) / w[m]
+        d = abs((w[m + 1] - w[m - 1]) / w[m] - b1)
         if d > FFE_BOUNDS.diff_limit + atol:
-            viol.append("differential limit: |w(+1)-w(-1)|/w(0)=%.4f > %.2f"
-                        % (d, FFE_BOUNDS.diff_limit))
+            viol.append("differential limit: |w(+1)/w(0)-b(1)-w(-1)/w(0)|="
+                        "%.4f > %.2f" % (d, FFE_BOUNDS.diff_limit))
     return (len(viol) == 0), viol
+
+
+def pam4_feedback(tru, oma):
+    """Ideal previous-symbol DFE feedback in signal units.
+
+    Symbols 0..3 map to ``{-1,-1/3,+1/3,+1}``; element n contains
+    ``(OMA/2)*x(n-1)``.  The first element wraps to the final known reference
+    symbol, appropriate for the periodic test patterns used by TDECQ.
+    """
+    sym = np.asarray(tru, dtype=np.int64)
+    levels = np.array([-1.0, -1.0 / 3.0, 1.0 / 3.0, 1.0])
+    return 0.5 * float(oma) * levels[np.roll(sym, 1)]
+
+
+def apply_dfe(M, tru, oma, b1):
+    """Apply ``y(n)=FFE(n)-b(1)*(OMA/2)*x(n-1)`` to an FFE matrix."""
+    arr = np.asarray(M, dtype=float)
+    return arr - float(b1) * pam4_feedback(tru, oma)[:, None]
+
+
+def solve_joint_mmse(X, y, feedback, reg=1e-9):
+    """Unconstrained joint FFE/DFE LS solve.
+
+    The design matrix is ``[X, -feedback]`` and the returned tuple is
+    ``(w, b1)``.  FFE taps are normalised to unit sum; b1 is scaled by the
+    same factor so the joint output equation remains unchanged.
+    """
+    X = np.asarray(X, dtype=float)
+    f = np.asarray(feedback, dtype=float).reshape(-1, 1)
+    A = np.column_stack([X, -f])
+    q = np.linalg.solve(A.T @ A + reg * np.eye(A.shape[1]), A.T @ y)
+    s = float(np.sum(q[:-1]))
+    if abs(s) > 1e-12:
+        q = q / s
+    return np.asarray(q[:-1]), float(q[-1])
+
+
+def solve_joint_bounded_qp(X, y, feedback, main_index, b1_max=None,
+                           b1_unbounded=False):
+    """Joint bounded FFE/1-tap-DFE SLSQP solve.
+
+    Minimises ``||X*w-b1*feedback-y||^2`` with FFE box/unit-gain limits,
+    ``0 <= b1 < 0.3`` (or ``b1 < 1`` for the explicitly unbounded strategy),
+    and ``-0.25 <= w(+1)/w(0)-b1-w(-1)/w(0) <= 0.25``.
+    """
+    X = np.asarray(X, dtype=float)
+    y = np.asarray(y, dtype=float)
+    f = np.asarray(feedback, dtype=float)
+    N = X.shape[1]
+    m = int(main_index)
+    lb, ub, x0w = _design(X, y, m)
+    hi_cfg = FFE_BOUNDS.b1_unbounded_max if b1_unbounded else FFE_BOUNDS.b1_max
+    if b1_max is not None:
+        hi_cfg = min(hi_cfg, float(b1_max))
+    hi = (float(hi_cfg) - FFE_BOUNDS.b1_open_margin
+          if not b1_unbounded and hi_cfg >= FFE_BOUNDS.b1_max
+          else np.nextafter(float(hi_cfg), 0.0))
+    x0 = np.concatenate([x0w, [min(0.1, 0.5 * hi)]])
+
+    def fun(q):
+        r = X @ q[:N] - q[N] * f - y
+        return float(r @ r)
+
+    cons = [{"type": "eq", "fun": lambda q: float(q[:N].sum()) - 1.0}]
+    if m - 1 >= 0 and m + 1 < N:
+        cons += [
+            {"type": "ineq", "fun": lambda q:
+             FFE_BOUNDS.diff_limit * q[m] -
+             (q[m + 1] - q[m - 1] - q[N] * q[m])},
+            {"type": "ineq", "fun": lambda q:
+             FFE_BOUNDS.diff_limit * q[m] +
+             (q[m + 1] - q[m - 1] - q[N] * q[m])},
+        ]
+    if minimize is None:  # pragma: no cover
+        return x0w, 0.0
+    res = minimize(fun, x0, method="SLSQP",
+                   bounds=list(zip(lb, ub)) + [(0.0, hi)],
+                   constraints=cons, options={"maxiter": 400, "ftol": 1e-12})
+    if not res.success:
+        return x0w, 0.0
+    return np.asarray(res.x[:N]), float(res.x[N])
 
 
 def project_feasible(w, main_index, iters=12):
@@ -336,19 +461,20 @@ def _design(X, y, main_index):
     N = X.shape[1]
     m = int(main_index)
     lb, ub = bounds_for(N, m)
-    x0 = np.full(N, 1.0 / N)
+    # Identity is exactly unit-gain and satisfies the main-tap lower bound;
+    # normalising a clipped uniform vector can pull the main tap below 0.8
+    # and gives SLSQP an infeasible starting point.
+    x0 = np.zeros(N, dtype=float)
     x0[m] = 1.0
-    x0 = np.clip(x0, lb, ub)
-    x0 = x0 / x0.sum()
     return lb, ub, x0
 
 
-def solve_bounded_qp(X, y, main_index, diff_lim=None):
+def solve_bounded_qp(X, y, main_index, diff_lim=None, b1=0.0):
     """Bounded quadratic programme (SLSQP): box + unit gain + differential.
 
     Minimises ``||X w - y||^2`` subject to ``lb <= w <= ub``, ``sum(w) = 1``
     and (when both neighbours of the main tap exist)
-    ``-diff_lim*w(m) <= w(m+1) - w(m-1) <= diff_lim*w(m)``.
+    ``|w(m+1)-w(m-1)-b1*w(m)| <= diff_lim*w(m)``.
 
     Parameters
     ----------
@@ -357,6 +483,8 @@ def solve_bounded_qp(X, y, main_index, diff_lim=None):
     main_index : int
     diff_lim : float or None
         differential limit (defaults to ``FFE_BOUNDS.diff_limit``).
+    b1 : float
+        fixed DFE coefficient used by the coupled differential constraint.
 
     Returns
     -------
@@ -377,11 +505,14 @@ def solve_bounded_qp(X, y, main_index, diff_lim=None):
         return float(r @ r)
 
     cons = [{"type": "eq", "fun": lambda w: float(w.sum()) - 1.0}]
+    b1 = float(b1)
     if m - 1 >= 0 and m + 1 < N:
         cons.append({"type": "ineq",
-                     "fun": lambda w: diff_lim * w[m] - (w[m + 1] - w[m - 1])})
+                     "fun": lambda w: diff_lim * w[m] -
+                     (w[m + 1] - w[m - 1] - b1 * w[m])})
         cons.append({"type": "ineq",
-                     "fun": lambda w: diff_lim * w[m] + (w[m + 1] - w[m - 1])})
+                     "fun": lambda w: diff_lim * w[m] +
+                     (w[m + 1] - w[m - 1] - b1 * w[m])})
     import warnings as _warnings
     with _warnings.catch_warnings():
         # SLSQP temporarily evaluates infeasible iterates outside the box
@@ -403,6 +534,75 @@ def solve_bounded_qp(X, y, main_index, diff_lim=None):
     w[others] = res2.x
     w[m] = 1.0 - float(res2.x.sum())
     return project_feasible(w, m)
+
+
+def solve_eye_lid_qp(Mj, tru, nom, cdr, spu, main_index,
+                     centre_weight=0.25):
+    """Bounded FFE fit for thin 0.45/0.55-UI lids without eye collapse.
+
+    The convex objective combines two terms:
+
+    * within-class variation at all four TDECQ window phases (direct lid
+      thickness); and
+    * centre-phase tracking of the nominal PAM4 levels (eye-opening guard).
+
+    ``centre_weight`` is global and waveform-independent.  The resulting
+    stacked least-squares problem is solved by the same bounded QP used by
+    the reference FFE, so box, unit-gain and differential limits remain in
+    force.  Final selection is still performed using the full TDECQ metric.
+    """
+    from . import eq  # local import avoids module cycle
+    stack = np.asarray(Mj, dtype=float)
+    labels = np.asarray(tru, dtype=np.int64)
+    target_levels = np.asarray(nom, dtype=float)
+    alpha = float(np.clip(centre_weight, 0.0, 1.0))
+    left, right = eq.window_phase_indices(int(cdr), int(spu))
+    phases = left + right
+    N = stack.shape[0]
+    gram_lid = np.zeros((N, N), dtype=float)
+    for phase in phases:
+        Xp = stack[:, :, phase].T
+        class_mean_rows = np.zeros_like(Xp)
+        for cls in range(4):
+            mask = labels == cls
+            if np.any(mask):
+                class_mean_rows[mask] = np.mean(Xp[mask], axis=0)
+        A = Xp - class_mean_rows
+        gram_lid += (A.T @ A) / max(1, len(labels) * len(phases))
+    centre_X = stack[:, :, int(cdr)].T
+    centre_y = target_levels[labels]
+    gram_centre = (centre_X.T @ centre_X) / max(1, len(labels))
+    cross_centre = (centre_X.T @ centre_y) / max(1, len(labels))
+    gram = (1.0 - alpha) * gram_lid + alpha * gram_centre
+    cross = alpha * cross_centre
+
+    m = int(main_index)
+    lb, ub, x0 = _design(centre_X, centre_y, m)
+    if minimize is None:  # pragma: no cover
+        return x0
+
+    def fun(w):
+        return float(w @ gram @ w - 2.0 * cross @ w)
+
+    def jac(w):
+        return 2.0 * (gram @ w - cross)
+
+    cons = [{"type": "eq", "fun": lambda w: float(w.sum()) - 1.0}]
+    if m - 1 >= 0 and m + 1 < N:
+        cons += [
+            {"type": "ineq", "fun": lambda w:
+             FFE_BOUNDS.diff_limit * w[m] - (w[m + 1] - w[m - 1])},
+            {"type": "ineq", "fun": lambda w:
+             FFE_BOUNDS.diff_limit * w[m] + (w[m + 1] - w[m - 1])},
+        ]
+    res = minimize(fun, x0, jac=jac, method="SLSQP",
+                   bounds=list(zip(lb, ub)), constraints=cons,
+                   options={"maxiter": 200, "ftol": 1e-12})
+    if res.success:
+        return np.asarray(res.x, dtype=float)
+    # The identity is always a safe feasible candidate; final pool scoring
+    # will reject it when it provides no benefit.
+    return x0
 
 
 def solve_active_set(X, y, main_index, max_iter=50):
@@ -473,7 +673,7 @@ def solve_damped(X, y, main_index, alpha):
 
 def progressive_cd(v, spu, n_ui, tru, cdr, main_index, max_N=None,
                    n_sym_limit=32768, decimate=1,
-                   threshold_mode="linear"):
+                   threshold_mode="linear", dfe_oma=None):
     """Constrained projection coordinate descent with gradual tap expansion.
 
     Stage 1 runs coordinate descent from the identity at the starting tap
@@ -515,8 +715,9 @@ def progressive_cd(v, spu, n_ui, tru, cdr, main_index, max_N=None,
 
     Returns
     -------
-    (w, N_final) : the best feasible tap vector and its tap count, or None
-    when the record is too long for the metric evaluations.
+    Without ``dfe_oma`` the result is ``(w, N_final)``.  With ``dfe_oma`` it
+    is ``(w, N_final, b1)`` and b1 is included as a projected coordinate.
+    Returns None when the record is too long for metric evaluations.
     """
     from . import eq  # local import to avoid a cycle
     max_N = FFE_BOUNDS.N_candidates[-1] if max_N is None else int(max_N)
@@ -534,9 +735,12 @@ def progressive_cd(v, spu, n_ui, tru, cdr, main_index, max_N=None,
     w = np.zeros(N)
     w[m] = 1.0
     w = project_feasible(w, m)
+    b1 = 0.0
 
-    def metric_of(Mj, w, tru, cdr):
+    def metric_of(Mj, w, tru, cdr, b1=0.0):
         M = np.tensordot(Mj, w, axes=(0, 0))
+        if dfe_oma is not None and b1 > 0.0:
+            M = apply_dfe(M, tru, dfe_oma, b1)
         if dec > 1:
             M = M[::dec]
             tru = tru[::dec]
@@ -544,7 +748,7 @@ def progressive_cd(v, spu, n_ui, tru, cdr, main_index, max_N=None,
                                   threshold_mode=threshold_mode)
         return mdb
 
-    def descend(Mj, w, tru, m, best):
+    def descend(Mj, w, tru, m, b1, best):
         changed = True
         for _ in range(FFE_BOUNDS.max_iter):
             moved = False
@@ -556,18 +760,31 @@ def progressive_cd(v, spu, n_ui, tru, cdr, main_index, max_N=None,
                     wt[i] += d
                     wt[m] = 1.0 - (wt.sum() - wt[m])
                     wt = project_feasible(wt, m)
-                    ok, _ = check_feasible(wt, m)
+                    ok, _ = check_feasible(wt, m, b1=b1)
                     if not ok:
                         continue
-                    mt = metric_of(Mj, wt, tru, cdr)
+                    mt = metric_of(Mj, wt, tru, cdr, b1)
                     if mt < best - 1e-12:
                         w, best = wt, mt
                         moved = True
+            if dfe_oma is not None:
+                for db in (FFE_BOUNDS.step, -FFE_BOUNDS.step):
+                    bt = b1 + db
+                    if bt < 0.0 or bt >= FFE_BOUNDS.b1_max - 1e-9:
+                        continue
+                    ok, _ = check_feasible(w, m, b1=bt)
+                    if not ok:
+                        continue
+                    mt = metric_of(Mj, w, tru, cdr, bt)
+                    if mt < best - 1e-12:
+                        b1, best = bt, mt
+                        moved = True
             if not moved:
                 break
-        return w, best
+        return w, b1, best
 
-    w, best = descend(Mj, w, tru0, m, metric_of(Mj, w, tru0, cdr))
+    w, b1, best = descend(Mj, w, tru0, m, b1,
+                           metric_of(Mj, w, tru0, cdr, b1))
     while N < max_N:
         N2 = N + 2
         m2 = m + 1
@@ -581,12 +798,12 @@ def progressive_cd(v, spu, n_ui, tru, cdr, main_index, max_N=None,
         w2 = project_feasible(w2, m2)
         Mj2 = eq.build_Mj(v, spu, n_sym2, m2, N2 - 1 - m2)
         tru2 = np.asarray(tru[:n_sym2])
-        w2, best2 = descend(Mj2, w2, tru2, m2, best)
+        w2, b2, best2 = descend(Mj2, w2, tru2, m2, b1, best)
         if best2 < best - FFE_BOUNDS.extend_delta:
-            w, best, N, m = w2, best2, N2, m2
+            w, b1, best, N, m = w2, b2, best2, N2, m2
         else:
             break
-    return w, N
+    return (w, N, b1) if dfe_oma is not None else (w, N)
 
 
 def at_bound_info(w, main_index, atol=None):
